@@ -16,6 +16,7 @@ use ra_syntax::{
     match_ast, AstNode, SyntaxNode,
 };
 use rustc_hash::FxHashMap;
+use stdx::impl_from;
 
 use crate::{db::HirDatabase, InFile, MacroDefId};
 
@@ -194,6 +195,10 @@ impl SourceToDefCtx<'_, '_> {
                         let def = self.const_to_def(container.with_value(it))?;
                         DefWithBodyId::from(def).into()
                     },
+                    ast::TypeAliasDef(it) => {
+                        let def = self.type_alias_to_def(container.with_value(it))?;
+                        def.into()
+                    },
                     _ => continue,
                 }
             };
@@ -246,19 +251,21 @@ pub(crate) enum ChildContainer {
     ImplId(ImplId),
     EnumId(EnumId),
     VariantId(VariantId),
+    TypeAliasId(TypeAliasId),
     /// XXX: this might be the same def as, for example an `EnumId`. However,
     /// here the children generic parameters, and not, eg enum variants.
     GenericDefId(GenericDefId),
 }
-impl_froms! {
-    ChildContainer:
+impl_from! {
     DefWithBodyId,
     ModuleId,
     TraitId,
     ImplId,
     EnumId,
     VariantId,
+    TypeAliasId,
     GenericDefId
+    for ChildContainer
 }
 
 impl ChildContainer {
@@ -271,6 +278,7 @@ impl ChildContainer {
             ChildContainer::ImplId(it) => it.child_by_source(db),
             ChildContainer::EnumId(it) => it.child_by_source(db),
             ChildContainer::VariantId(it) => it.child_by_source(db),
+            ChildContainer::TypeAliasId(_) => DynMap::default(),
             ChildContainer::GenericDefId(it) => it.child_by_source(db),
         }
     }

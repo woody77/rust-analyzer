@@ -1,11 +1,11 @@
-use std::collections::HashMap;
+use itertools::Itertools;
+use rustc_hash::FxHashMap;
 
 use hir::{Adt, ModuleDef, PathResolution, Semantics, Struct};
-use itertools::Itertools;
 use ra_ide_db::RootDatabase;
 use ra_syntax::{algo, ast, match_ast, AstNode, SyntaxKind, SyntaxKind::*, SyntaxNode};
 
-use crate::{AssistContext, AssistId, Assists};
+use crate::{AssistContext, AssistId, AssistKind, Assists};
 
 // Assist: reorder_fields
 //
@@ -42,11 +42,16 @@ fn reorder<R: AstNode>(acc: &mut Assists, ctx: &AssistContext) -> Option<()> {
     }
 
     let target = record.syntax().text_range();
-    acc.add(AssistId("reorder_fields"), "Reorder record fields", target, |edit| {
-        for (old, new) in fields.iter().zip(&sorted_fields) {
-            algo::diff(old, new).into_text_edit(edit.text_edit_builder());
-        }
-    })
+    acc.add(
+        AssistId("reorder_fields", AssistKind::RefactorRewrite),
+        "Reorder record fields",
+        target,
+        |edit| {
+            for (old, new) in fields.iter().zip(&sorted_fields) {
+                algo::diff(old, new).into_text_edit(edit.text_edit_builder());
+            }
+        },
+    )
 }
 
 fn get_fields_kind(node: &SyntaxNode) -> Vec<SyntaxKind> {
@@ -87,13 +92,13 @@ fn struct_definition(path: &ast::Path, sema: &Semantics<RootDatabase>) -> Option
     }
 }
 
-fn compute_fields_ranks(path: &ast::Path, ctx: &AssistContext) -> Option<HashMap<String, usize>> {
+fn compute_fields_ranks(path: &ast::Path, ctx: &AssistContext) -> Option<FxHashMap<String, usize>> {
     Some(
         struct_definition(path, &ctx.sema)?
-            .fields(ctx.db)
+            .fields(ctx.db())
             .iter()
             .enumerate()
-            .map(|(idx, field)| (field.name(ctx.db).to_string(), idx))
+            .map(|(idx, field)| (field.name(ctx.db()).to_string(), idx))
             .collect(),
     )
 }

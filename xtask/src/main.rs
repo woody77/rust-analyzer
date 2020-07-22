@@ -14,10 +14,11 @@ use pico_args::Arguments;
 use xtask::{
     codegen::{self, Mode},
     dist::run_dist,
-    install::{ClientOpt, InstallCmd, ServerOpt},
+    install::{ClientOpt, InstallCmd, Malloc, ServerOpt},
     not_bash::pushd,
-    pre_commit, project_root, run_clippy, run_fuzzer, run_pre_cache, run_release, run_rustfmt,
-    Result,
+    pre_commit, project_root,
+    release::{PromoteCmd, ReleaseCmd},
+    run_clippy, run_fuzzer, run_pre_cache, run_rustfmt, Result,
 };
 
 fn main() -> Result<()> {
@@ -45,6 +46,7 @@ FLAGS:
         --client-code    Install only VS Code plugin
         --server         Install only the language server
         --jemalloc       Use jemalloc for server
+        --mimalloc       Use mimalloc for server
     -h, --help           Prints help information
         "
                 );
@@ -60,13 +62,21 @@ FLAGS:
                 return Ok(());
             }
 
-            let jemalloc = args.contains("--jemalloc");
+            let malloc = match (args.contains("--jemalloc"), args.contains("--mimalloc")) {
+                (false, false) => Malloc::System,
+                (true, false) => Malloc::Jemalloc,
+                (false, true) => Malloc::Mimalloc,
+                (true, true) => {
+                    eprintln!("error: Cannot use both `--jemalloc` and `--mimalloc`");
+                    return Ok(());
+                }
+            };
 
             args.finish()?;
 
             InstallCmd {
                 client: if server { None } else { Some(ClientOpt::VsCode) },
-                server: if client_code { None } else { Some(ServerOpt { jemalloc }) },
+                server: if client_code { None } else { Some(ServerOpt { malloc }) },
             }
             .run()
         }
@@ -102,7 +112,12 @@ FLAGS:
         "release" => {
             let dry_run = args.contains("--dry-run");
             args.finish()?;
-            run_release(dry_run)
+            ReleaseCmd { dry_run }.run()
+        }
+        "promote" => {
+            let dry_run = args.contains("--dry-run");
+            args.finish()?;
+            PromoteCmd { dry_run }.run()
         }
         "dist" => {
             let nightly = args.contains("--nightly");

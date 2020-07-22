@@ -5,12 +5,17 @@ use ra_db::SourceDatabase;
 use ra_ide_db::RootDatabase;
 use ra_syntax::{
     algo::{find_covering_element, find_node_at_offset},
-    ast, match_ast, AstNode,
+    ast, match_ast, AstNode, NodeOrToken,
     SyntaxKind::*,
     SyntaxNode, SyntaxToken, TextRange, TextSize,
 };
 use ra_text_edit::Indel;
 
+use super::patterns::{
+    has_bind_pat_parent, has_block_expr_parent, has_impl_as_prev_sibling, has_impl_parent,
+    has_item_list_or_source_file_parent, has_ref_parent, has_trait_as_prev_sibling,
+    has_trait_parent, if_is_prev, is_in_loop_body, is_match_arm, unsafe_is_prev,
+};
 use crate::{call_info::ActiveParameter, completion::CompletionConfig, FilePosition};
 use test_utils::mark;
 
@@ -19,6 +24,7 @@ use test_utils::mark;
 #[derive(Debug)]
 pub(crate) struct CompletionContext<'a> {
     pub(super) sema: Semantics<'a, RootDatabase>,
+    pub(super) scope: SemanticsScope<'a>,
     pub(super) db: &'a RootDatabase,
     pub(super) config: &'a CompletionConfig,
     pub(super) offset: TextSize,
@@ -48,6 +54,8 @@ pub(crate) struct CompletionContext<'a> {
     pub(super) after_if: bool,
     /// `true` if we are a statement or a last expr in the block.
     pub(super) can_be_stmt: bool,
+    /// `true` if we expect an expression at the cursor position.
+    pub(super) is_expr: bool,
     /// Something is typed at the "top" level, in module or impl/trait.
     pub(super) is_new_item: bool,
     /// The receiver if this is a field or method access, i.e. writing something.<|>
@@ -55,11 +63,25 @@ pub(crate) struct CompletionContext<'a> {
     pub(super) dot_receiver_is_ambiguous_float_literal: bool,
     /// If this is a call (method or function) in particular, i.e. the () are already there.
     pub(super) is_call: bool,
+    /// Like `is_call`, but for tuple patterns.
+    pub(super) is_pattern_call: bool,
     /// If this is a macro call, i.e. the () are already there.
     pub(super) is_macro_call: bool,
     pub(super) is_path_type: bool,
     pub(super) has_type_args: bool,
     pub(super) attribute_under_caret: Option<ast::Attr>,
+    pub(super) unsafe_is_prev: bool,
+    pub(super) if_is_prev: bool,
+    pub(super) block_expr_parent: bool,
+    pub(super) bind_pat_parent: bool,
+    pub(super) ref_pat_parent: bool,
+    pub(super) in_loop_body: bool,
+    pub(super) has_trait_parent: bool,
+    pub(super) has_impl_parent: bool,
+    pub(super) trait_as_prev_sibling: bool,
+    pub(super) impl_as_prev_sibling: bool,
+    pub(super) is_match_arm: bool,
+    pub(super) has_item_list_or_source_file_parent: bool,
 }
 
 impl<'a> CompletionContext<'a> {
@@ -87,8 +109,10 @@ impl<'a> CompletionContext<'a> {
         let original_token =
             original_file.syntax().token_at_offset(position.offset).left_biased()?;
         let token = sema.descend_into_macros(original_token.clone());
+        let scope = sema.scope_at_offset(&token.parent(), position.offset);
         let mut ctx = CompletionContext {
             sema,
+            scope,
             db,
             config,
             original_token,
@@ -110,14 +134,28 @@ impl<'a> CompletionContext<'a> {
             path_prefix: None,
             after_if: false,
             can_be_stmt: false,
+            is_expr: false,
             is_new_item: false,
             dot_receiver: None,
             is_call: false,
+            is_pattern_call: false,
             is_macro_call: false,
             is_path_type: false,
             has_type_args: false,
             dot_receiver_is_ambiguous_float_literal: false,
             attribute_under_caret: None,
+            unsafe_is_prev: false,
+            in_loop_body: false,
+            ref_pat_parent: false,
+            bind_pat_parent: false,
+            block_expr_parent: false,
+            has_trait_parent: false,
+            has_impl_parent: false,
+            trait_as_prev_sibling: false,
+            impl_as_prev_sibling: false,
+            if_is_prev: false,
+            is_match_arm: false,
+            has_item_list_or_source_file_parent: false,
         };
 
         let mut original_file = original_file.syntax().clone();
@@ -159,7 +197,7 @@ impl<'a> CompletionContext<'a> {
                 break;
             }
         }
-
+        ctx.fill_keyword_patterns(&hypothetical_file, offset);
         ctx.fill(&original_file, hypothetical_file, offset);
         Some(ctx)
     }
@@ -167,25 +205,30 @@ impl<'a> CompletionContext<'a> {
     // The range of the identifier that is being completed.
     pub(crate) fn source_range(&self) -> TextRange {
         // check kind of macro-expanded token, but use range of original token
-        match self.token.kind() {
-            // workaroud when completion is triggered by trigger characters.
-            IDENT => self.original_token.text_range(),
-            _ => {
-                // If we haven't characters between keyword and our cursor we take the keyword start range to edit
-                if self.token.kind().is_keyword()
-                    && self.offset == self.original_token.text_range().end()
-                {
-                    mark::hit!(completes_bindings_from_for_with_in_prefix);
-                    TextRange::empty(self.original_token.text_range().start())
-                } else {
-                    TextRange::empty(self.offset)
-                }
-            }
+        if self.token.kind() == IDENT || self.token.kind().is_keyword() {
+            mark::hit!(completes_if_prefix_is_keyword);
+            self.original_token.text_range()
+        } else {
+            TextRange::empty(self.offset)
         }
     }
 
-    pub(crate) fn scope(&self) -> SemanticsScope<'_, RootDatabase> {
-        self.sema.scope_at_offset(&self.token.parent(), self.offset)
+    fn fill_keyword_patterns(&mut self, file_with_fake_ident: &SyntaxNode, offset: TextSize) {
+        let fake_ident_token = file_with_fake_ident.token_at_offset(offset).right_biased().unwrap();
+        let syntax_element = NodeOrToken::Token(fake_ident_token);
+        self.block_expr_parent = has_block_expr_parent(syntax_element.clone());
+        self.unsafe_is_prev = unsafe_is_prev(syntax_element.clone());
+        self.if_is_prev = if_is_prev(syntax_element.clone());
+        self.bind_pat_parent = has_bind_pat_parent(syntax_element.clone());
+        self.ref_pat_parent = has_ref_parent(syntax_element.clone());
+        self.in_loop_body = is_in_loop_body(syntax_element.clone());
+        self.has_trait_parent = has_trait_parent(syntax_element.clone());
+        self.has_impl_parent = has_impl_parent(syntax_element.clone());
+        self.impl_as_prev_sibling = has_impl_as_prev_sibling(syntax_element.clone());
+        self.trait_as_prev_sibling = has_trait_as_prev_sibling(syntax_element.clone());
+        self.is_match_arm = is_match_arm(syntax_element.clone());
+        self.has_item_list_or_source_file_parent =
+            has_item_list_or_source_file_parent(syntax_element);
     }
 
     fn fill(
@@ -330,10 +373,13 @@ impl<'a> CompletionContext<'a> {
                 .and_then(|it| it.syntax().parent().and_then(ast::CallExpr::cast))
                 .is_some();
             self.is_macro_call = path.syntax().parent().and_then(ast::MacroCall::cast).is_some();
+            self.is_pattern_call =
+                path.syntax().parent().and_then(ast::TupleStructPat::cast).is_some();
 
             self.is_path_type = path.syntax().parent().and_then(ast::PathType::cast).is_some();
             self.has_type_args = segment.type_arg_list().is_some();
 
+            #[allow(deprecated)]
             if let Some(path) = hir::Path::from_ast(path.clone()) {
                 if let Some(path_prefix) = path.qualifier() {
                     self.path_prefix = Some(path_prefix);
@@ -364,6 +410,7 @@ impl<'a> CompletionContext<'a> {
                         None
                     })
                     .unwrap_or(false);
+                self.is_expr = path.syntax().parent().and_then(ast::PathExpr::cast).is_some();
 
                 if let Some(off) = name_ref.syntax().text_range().start().checked_sub(2.into()) {
                     if let Some(if_expr) =

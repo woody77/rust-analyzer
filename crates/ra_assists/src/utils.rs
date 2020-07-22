@@ -7,13 +7,15 @@ use hir::{Adt, Crate, Enum, ScopeDef, Semantics, Trait, Type};
 use ra_ide_db::RootDatabase;
 use ra_syntax::{
     ast::{self, make, NameOwner},
-    AstNode, SyntaxNode, T,
+    AstNode,
+    SyntaxKind::*,
+    SyntaxNode, TextSize, T,
 };
 use rustc_hash::FxHashSet;
 
 use crate::assist_config::SnippetCap;
 
-pub(crate) use insert_use::insert_use_statement;
+pub(crate) use insert_use::{find_insert_use_container, insert_use_statement};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Cursor<'a> {
@@ -120,6 +122,13 @@ pub(crate) fn resolve_target_trait(
     }
 }
 
+pub(crate) fn vis_offset(node: &SyntaxNode) -> TextSize {
+    node.children_with_tokens()
+        .find(|it| !matches!(it.kind(), WHITESPACE | COMMENT | ATTR))
+        .map(|it| it.text_range().start())
+        .unwrap_or_else(|| node.text_range().start())
+}
+
 pub(crate) fn invert_boolean_expression(expr: ast::Expr) -> ast::Expr {
     if let Some(expr) = invert_special_case(&expr) {
         return expr;
@@ -198,8 +207,7 @@ pub(crate) struct FamousDefs<'a, 'b>(pub(crate) &'a Semantics<'b, RootDatabase>,
 #[allow(non_snake_case)]
 impl FamousDefs<'_, '_> {
     #[cfg(test)]
-    pub(crate) const FIXTURE: &'static str = r#"
-//- /libcore.rs crate:core
+    pub(crate) const FIXTURE: &'static str = r#"//- /libcore.rs crate:core
 pub mod convert {
     pub trait From<T> {
         fn from(T) -> Self;

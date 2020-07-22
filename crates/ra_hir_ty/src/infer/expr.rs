@@ -10,15 +10,15 @@ use hir_def::{
     resolver::resolver_for_expr,
     AdtId, AssocContainerId, FieldId, Lookup,
 };
-use hir_expand::name::Name;
+use hir_expand::name::{name, Name};
 use ra_syntax::ast::RangeOp;
 
 use crate::{
     autoderef, method_resolution, op,
-    traits::InEnvironment,
+    traits::{FnTrait, InEnvironment},
     utils::{generics, variant_data, Generics},
-    ApplicationTy, Binders, CallableDef, InferTy, IntTy, Mutability, Obligation, Rawness, Substs,
-    TraitRef, Ty, TypeCtor, Uncertain,
+    ApplicationTy, Binders, CallableDefId, InferTy, IntTy, Mutability, Obligation, Rawness, Substs,
+    TraitRef, Ty, TypeCtor,
 };
 
 use super::{
@@ -63,6 +63,56 @@ impl<'a> InferenceContext<'a> {
         self.resolve_ty_as_possible(ty)
     }
 
+    fn callable_sig_from_fn_trait(&mut self, ty: &Ty, num_args: usize) -> Option<(Vec<Ty>, Ty)> {
+        let krate = self.resolver.krate()?;
+        let fn_once_trait = FnTrait::FnOnce.get_id(self.db, krate)?;
+        let output_assoc_type =
+            self.db.trait_data(fn_once_trait).associated_type_by_name(&name![Output])?;
+        let generic_params = generics(self.db.upcast(), fn_once_trait.into());
+        if generic_params.len() != 2 {
+            return None;
+        }
+
+        let mut param_builder = Substs::builder(num_args);
+        let mut arg_tys = vec![];
+        for _ in 0..num_args {
+            let arg = self.table.new_type_var();
+            param_builder = param_builder.push(arg.clone());
+            arg_tys.push(arg);
+        }
+        let parameters = param_builder.build();
+        let arg_ty = Ty::Apply(ApplicationTy {
+            ctor: TypeCtor::Tuple { cardinality: num_args as u16 },
+            parameters,
+        });
+        let substs =
+            Substs::build_for_generics(&generic_params).push(ty.clone()).push(arg_ty).build();
+
+        let trait_env = Arc::clone(&self.trait_env);
+        let implements_fn_trait =
+            Obligation::Trait(TraitRef { trait_: fn_once_trait, substs: substs.clone() });
+        let goal = self.canonicalizer().canonicalize_obligation(InEnvironment {
+            value: implements_fn_trait.clone(),
+            environment: trait_env,
+        });
+        if self.db.trait_solve(krate, goal.value).is_some() {
+            self.obligations.push(implements_fn_trait);
+            let output_proj_ty =
+                crate::ProjectionTy { associated_ty: output_assoc_type, parameters: substs };
+            let return_ty = self.normalize_projection_ty(output_proj_ty);
+            Some((arg_tys, return_ty))
+        } else {
+            None
+        }
+    }
+
+    pub fn callable_sig(&mut self, ty: &Ty, num_args: usize) -> Option<(Vec<Ty>, Ty)> {
+        match ty.callable_sig(self.db) {
+            Some(sig) => Some((sig.params().to_vec(), sig.ret().clone())),
+            None => self.callable_sig_from_fn_trait(ty, num_args),
+        }
+    }
+
     fn infer_expr_inner(&mut self, tgt_expr: ExprId, expected: &Expectation) -> Ty {
         let body = Arc::clone(&self.body); // avoid borrow checker problem
         let ty = match &body[tgt_expr] {
@@ -90,6 +140,7 @@ impl<'a> InferenceContext<'a> {
                 // FIXME: Breakable block inference
                 self.infer_block(statements, *tail, expected)
             }
+            Expr::Unsafe { body } => self.infer_expr(*body, expected),
             Expr::TryBlock { body } => {
                 let _inner = self.infer_expr(*body, expected);
                 // FIXME should be std::result::Result<{inner}, _>
@@ -169,7 +220,7 @@ impl<'a> InferenceContext<'a> {
                 };
                 sig_tys.push(ret_ty.clone());
                 let sig_ty = Ty::apply(
-                    TypeCtor::FnPtr { num_args: sig_tys.len() as u16 - 1 },
+                    TypeCtor::FnPtr { num_args: sig_tys.len() as u16 - 1, is_varargs: false },
                     Substs(sig_tys.clone().into()),
                 );
                 let closure_ty =
@@ -198,14 +249,23 @@ impl<'a> InferenceContext<'a> {
             }
             Expr::Call { callee, args } => {
                 let callee_ty = self.infer_expr(*callee, &Expectation::none());
-                let (param_tys, ret_ty) = match callee_ty.callable_sig(self.db) {
-                    Some(sig) => (sig.params().to_vec(), sig.ret().clone()),
-                    None => {
-                        // Not callable
-                        // FIXME: report an error
-                        (Vec::new(), Ty::Unknown)
-                    }
-                };
+                let canonicalized = self.canonicalizer().canonicalize_ty(callee_ty.clone());
+                let mut derefs = autoderef(
+                    self.db,
+                    self.resolver.krate(),
+                    InEnvironment {
+                        value: canonicalized.value.clone(),
+                        environment: self.trait_env.clone(),
+                    },
+                );
+                let (param_tys, ret_ty): (Vec<Ty>, Ty) = derefs
+                    .find_map(|callee_deref_ty| {
+                        self.callable_sig(
+                            &canonicalized.decanonicalize_ty(callee_deref_ty.value),
+                            args.len(),
+                        )
+                    })
+                    .unwrap_or((Vec::new(), Ty::Unknown));
                 self.register_obligations_for_call(&callee_ty);
                 self.check_call_arguments(args, &param_tys);
                 self.normalize_associated_types_in(ret_ty)
@@ -345,8 +405,15 @@ impl<'a> InferenceContext<'a> {
                                     .subst(&a_ty.parameters)
                             })
                         }
-                        // FIXME:
-                        TypeCtor::Adt(AdtId::UnionId(_)) => None,
+                        TypeCtor::Adt(AdtId::UnionId(u)) => {
+                            self.db.union_data(u).variant_data.field(name).map(|local_id| {
+                                let field = FieldId { parent: u.into(), local_id };
+                                self.write_field_resolution(tgt_expr, field);
+                                self.db.field_types(u.into())[field.local_id]
+                                    .clone()
+                                    .subst(&a_ty.parameters)
+                            })
+                        }
                         _ => None,
                     },
                     _ => None,
@@ -426,15 +493,7 @@ impl<'a> InferenceContext<'a> {
                         match &inner_ty {
                             // Fast path for builtins
                             Ty::Apply(ApplicationTy {
-                                ctor:
-                                    TypeCtor::Int(Uncertain::Known(IntTy {
-                                        signedness: Signedness::Signed,
-                                        ..
-                                    })),
-                                ..
-                            })
-                            | Ty::Apply(ApplicationTy {
-                                ctor: TypeCtor::Int(Uncertain::Unknown),
+                                ctor: TypeCtor::Int(IntTy { signedness: Signedness::Signed, .. }),
                                 ..
                             })
                             | Ty::Apply(ApplicationTy { ctor: TypeCtor::Float(_), .. })
@@ -577,9 +636,7 @@ impl<'a> InferenceContext<'a> {
                         );
                         self.infer_expr(
                             *repeat,
-                            &Expectation::has_type(Ty::simple(TypeCtor::Int(Uncertain::Known(
-                                IntTy::usize(),
-                            )))),
+                            &Expectation::has_type(Ty::simple(TypeCtor::Int(IntTy::usize()))),
                         );
                     }
                 }
@@ -592,13 +649,19 @@ impl<'a> InferenceContext<'a> {
                     Ty::apply_one(TypeCtor::Ref(Mutability::Shared), Ty::simple(TypeCtor::Str))
                 }
                 Literal::ByteString(..) => {
-                    let byte_type = Ty::simple(TypeCtor::Int(Uncertain::Known(IntTy::u8())));
+                    let byte_type = Ty::simple(TypeCtor::Int(IntTy::u8()));
                     let array_type = Ty::apply_one(TypeCtor::Array, byte_type);
                     Ty::apply_one(TypeCtor::Ref(Mutability::Shared), array_type)
                 }
                 Literal::Char(..) => Ty::simple(TypeCtor::Char),
-                Literal::Int(_v, ty) => Ty::simple(TypeCtor::Int((*ty).into())),
-                Literal::Float(_v, ty) => Ty::simple(TypeCtor::Float((*ty).into())),
+                Literal::Int(_v, ty) => match ty {
+                    Some(int_ty) => Ty::simple(TypeCtor::Int((*int_ty).into())),
+                    None => self.table.new_integer_var(),
+                },
+                Literal::Float(_v, ty) => match ty {
+                    Some(float_ty) => Ty::simple(TypeCtor::Float((*float_ty).into())),
+                    None => self.table.new_float_var(),
+                },
             },
         };
         // use a new type variable if we got Ty::Unknown here
@@ -727,11 +790,7 @@ impl<'a> InferenceContext<'a> {
         for &check_closures in &[false, true] {
             let param_iter = param_tys.iter().cloned().chain(repeat(Ty::Unknown));
             for (&arg, param_ty) in args.iter().zip(param_iter) {
-                let is_closure = match &self.body[arg] {
-                    Expr::Lambda { .. } => true,
-                    _ => false,
-                };
-
+                let is_closure = matches!(&self.body[arg], Expr::Lambda { .. });
                 if is_closure != check_closures {
                     continue;
                 }
@@ -795,7 +854,7 @@ impl<'a> InferenceContext<'a> {
                 }
                 // add obligation for trait implementation, if this is a trait method
                 match def {
-                    CallableDef::FunctionId(f) => {
+                    CallableDefId::FunctionId(f) => {
                         if let AssocContainerId::TraitId(trait_) =
                             f.lookup(self.db.upcast()).container
                         {
@@ -806,7 +865,7 @@ impl<'a> InferenceContext<'a> {
                             self.obligations.push(Obligation::Trait(TraitRef { trait_, substs }));
                         }
                     }
-                    CallableDef::StructId(_) | CallableDef::EnumVariantId(_) => {}
+                    CallableDefId::StructId(_) | CallableDefId::EnumVariantId(_) => {}
                 }
             }
         }

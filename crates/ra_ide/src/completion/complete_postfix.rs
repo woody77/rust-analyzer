@@ -8,13 +8,12 @@ use ra_text_edit::TextEdit;
 
 use crate::{
     completion::{
+        completion_config::SnippetCap,
         completion_context::CompletionContext,
         completion_item::{Builder, CompletionKind, Completions},
     },
-    CompletionItem,
+    CompletionItem, CompletionItemKind,
 };
-
-use super::completion_config::SnippetCap;
 
 pub(super) fn complete_postfix(acc: &mut Completions, ctx: &CompletionContext) {
     if !ctx.config.enable_postfix_completions {
@@ -91,7 +90,7 @@ pub(super) fn complete_postfix(acc: &mut Completions, ctx: &CompletionContext) {
             &dot_receiver,
             "if",
             "if expr {}",
-            &format!("if {} {{$0}}", receiver_text),
+            &format!("if {} {{\n    $0\n}}", receiver_text),
         )
         .add_to(acc);
         postfix_snippet(
@@ -100,13 +99,12 @@ pub(super) fn complete_postfix(acc: &mut Completions, ctx: &CompletionContext) {
             &dot_receiver,
             "while",
             "while expr {}",
-            &format!("while {} {{\n$0\n}}", receiver_text),
+            &format!("while {} {{\n    $0\n}}", receiver_text),
         )
         .add_to(acc);
+        postfix_snippet(ctx, cap, &dot_receiver, "not", "!expr", &format!("!{}", receiver_text))
+            .add_to(acc);
     }
-    // !&&&42 is a compiler error, ergo process it before considering the references
-    postfix_snippet(ctx, cap, &dot_receiver, "not", "!expr", &format!("!{}", receiver_text))
-        .add_to(acc);
 
     postfix_snippet(ctx, cap, &dot_receiver, "ref", "&expr", &format!("&{}", receiver_text))
         .add_to(acc);
@@ -125,33 +123,35 @@ pub(super) fn complete_postfix(acc: &mut Completions, ctx: &CompletionContext) {
     let dot_receiver = include_references(dot_receiver);
     let receiver_text =
         get_receiver_text(&dot_receiver, ctx.dot_receiver_is_ambiguous_float_literal);
+
     match try_enum {
-        Some(try_enum) => {
-            match try_enum {
-                TryEnum::Result => {
-                    postfix_snippet(
+        Some(try_enum) => match try_enum {
+            TryEnum::Result => {
+                postfix_snippet(
                     ctx,
                     cap,
                     &dot_receiver,
                     "match",
                     "match expr {}",
-                    &format!("match {} {{\n    Ok(${{1:_}}) => {{$2\\}},\n    Err(${{3:_}}) => {{$0\\}},\n}}", receiver_text),
+                    &format!("match {} {{\n    Ok(${{1:_}}) => {{$2}},\n    Err(${{3:_}}) => {{$0}},\n}}", receiver_text),
                 )
                 .add_to(acc);
-                }
-                TryEnum::Option => {
-                    postfix_snippet(
-                    ctx,
-                    cap,
-                    &dot_receiver,
-                    "match",
-                    "match expr {}",
-                    &format!("match {} {{\n    Some(${{1:_}}) => {{$2\\}},\n    None => {{$0\\}},\n}}", receiver_text),
-                )
-                .add_to(acc);
-                }
             }
-        }
+            TryEnum::Option => {
+                postfix_snippet(
+                    ctx,
+                    cap,
+                    &dot_receiver,
+                    "match",
+                    "match expr {}",
+                    &format!(
+                        "match {} {{\n    Some(${{1:_}}) => {{$2}},\n    None => {{$0}},\n}}",
+                        receiver_text
+                    ),
+                )
+                .add_to(acc);
+            }
+        },
         None => {
             postfix_snippet(
                 ctx,
@@ -159,7 +159,7 @@ pub(super) fn complete_postfix(acc: &mut Completions, ctx: &CompletionContext) {
                 &dot_receiver,
                 "match",
                 "match expr {}",
-                &format!("match {} {{\n    ${{1:_}} => {{$0\\}},\n}}", receiver_text),
+                &format!("match {} {{\n    ${{1:_}} => {{$0}},\n}}", receiver_text),
             )
             .add_to(acc);
         }
@@ -232,536 +232,147 @@ fn postfix_snippet(
     };
     CompletionItem::new(CompletionKind::Postfix, ctx.source_range(), label)
         .detail(detail)
+        .kind(CompletionItemKind::Snippet)
         .snippet_edit(cap, edit)
 }
 
 #[cfg(test)]
 mod tests {
-    use insta::assert_debug_snapshot;
+    use expect::{expect, Expect};
 
-    use crate::completion::{test_utils::do_completion, CompletionItem, CompletionKind};
+    use crate::completion::{
+        test_utils::{check_edit, completion_list},
+        CompletionKind,
+    };
 
-    fn do_postfix_completion(code: &str) -> Vec<CompletionItem> {
-        do_completion(code, CompletionKind::Postfix)
+    fn check(ra_fixture: &str, expect: Expect) {
+        let actual = completion_list(ra_fixture, CompletionKind::Postfix);
+        expect.assert_eq(&actual)
     }
 
     #[test]
     fn postfix_completion_works_for_trivial_path_expression() {
-        assert_debug_snapshot!(
-            do_postfix_completion(
-                r#"
-                fn main() {
-                    let bar = true;
-                    bar.<|>
-                }
-                "#,
-            ),
-            @r###"
-        [
-            CompletionItem {
-                label: "box",
-                source_range: 89..89,
-                delete: 85..89,
-                insert: "Box::new(bar)",
-                detail: "Box::new(expr)",
-            },
-            CompletionItem {
-                label: "call",
-                source_range: 89..89,
-                delete: 85..89,
-                insert: "${1}(bar)",
-                detail: "function(expr)",
-            },
-            CompletionItem {
-                label: "dbg",
-                source_range: 89..89,
-                delete: 85..89,
-                insert: "dbg!(bar)",
-                detail: "dbg!(expr)",
-            },
-            CompletionItem {
-                label: "if",
-                source_range: 89..89,
-                delete: 85..89,
-                insert: "if bar {$0}",
-                detail: "if expr {}",
-            },
-            CompletionItem {
-                label: "match",
-                source_range: 89..89,
-                delete: 85..89,
-                insert: "match bar {\n    ${1:_} => {$0\\},\n}",
-                detail: "match expr {}",
-            },
-            CompletionItem {
-                label: "not",
-                source_range: 89..89,
-                delete: 85..89,
-                insert: "!bar",
-                detail: "!expr",
-            },
-            CompletionItem {
-                label: "ref",
-                source_range: 89..89,
-                delete: 85..89,
-                insert: "&bar",
-                detail: "&expr",
-            },
-            CompletionItem {
-                label: "refm",
-                source_range: 89..89,
-                delete: 85..89,
-                insert: "&mut bar",
-                detail: "&mut expr",
-            },
-            CompletionItem {
-                label: "while",
-                source_range: 89..89,
-                delete: 85..89,
-                insert: "while bar {\n$0\n}",
-                detail: "while expr {}",
-            },
-        ]
-        "###
+        check(
+            r#"
+fn main() {
+    let bar = true;
+    bar.<|>
+}
+"#,
+            expect![[r#"
+                sn box   Box::new(expr)
+                sn call  function(expr)
+                sn dbg   dbg!(expr)
+                sn if    if expr {}
+                sn match match expr {}
+                sn not   !expr
+                sn ref   &expr
+                sn refm  &mut expr
+                sn while while expr {}
+            "#]],
         );
     }
 
     #[test]
-    fn postfix_completion_works_for_option() {
-        assert_debug_snapshot!(
-            do_postfix_completion(
-                r#"
-                enum Option<T> {
-                    Some(T),
-                    None,
-                }
+    fn postfix_type_filtering() {
+        check(
+            r#"
+fn main() {
+    let bar: u8 = 12;
+    bar.<|>
+}
+"#,
+            expect![[r#"
+                sn box   Box::new(expr)
+                sn call  function(expr)
+                sn dbg   dbg!(expr)
+                sn match match expr {}
+                sn ref   &expr
+                sn refm  &mut expr
+            "#]],
+        )
+    }
 
-                fn main() {
-                    let bar = Option::Some(true);
-                    bar.<|>
-                }
-                "#,
-            ),
-            @r###"
-        [
-            CompletionItem {
-                label: "box",
-                source_range: 210..210,
-                delete: 206..210,
-                insert: "Box::new(bar)",
-                detail: "Box::new(expr)",
-            },
-            CompletionItem {
-                label: "call",
-                source_range: 210..210,
-                delete: 206..210,
-                insert: "${1}(bar)",
-                detail: "function(expr)",
-            },
-            CompletionItem {
-                label: "dbg",
-                source_range: 210..210,
-                delete: 206..210,
-                insert: "dbg!(bar)",
-                detail: "dbg!(expr)",
-            },
-            CompletionItem {
-                label: "ifl",
-                source_range: 210..210,
-                delete: 206..210,
-                insert: "if let Some($1) = bar {\n    $0\n}",
-                detail: "if let Some {}",
-            },
-            CompletionItem {
-                label: "match",
-                source_range: 210..210,
-                delete: 206..210,
-                insert: "match bar {\n    Some(${1:_}) => {$2\\},\n    None => {$0\\},\n}",
-                detail: "match expr {}",
-            },
-            CompletionItem {
-                label: "not",
-                source_range: 210..210,
-                delete: 206..210,
-                insert: "!bar",
-                detail: "!expr",
-            },
-            CompletionItem {
-                label: "ref",
-                source_range: 210..210,
-                delete: 206..210,
-                insert: "&bar",
-                detail: "&expr",
-            },
-            CompletionItem {
-                label: "refm",
-                source_range: 210..210,
-                delete: 206..210,
-                insert: "&mut bar",
-                detail: "&mut expr",
-            },
-            CompletionItem {
-                label: "while",
-                source_range: 210..210,
-                delete: 206..210,
-                insert: "while let Some($1) = bar {\n    $0\n}",
-                detail: "while let Some {}",
-            },
-        ]
-        "###
+    #[test]
+    fn option_iflet() {
+        check_edit(
+            "ifl",
+            r#"
+enum Option<T> { Some(T), None }
+
+fn main() {
+    let bar = Option::Some(true);
+    bar.<|>
+}
+"#,
+            r#"
+enum Option<T> { Some(T), None }
+
+fn main() {
+    let bar = Option::Some(true);
+    if let Some($1) = bar {
+    $0
+}
+}
+"#,
         );
     }
 
     #[test]
-    fn postfix_completion_works_for_result() {
-        assert_debug_snapshot!(
-            do_postfix_completion(
-                r#"
-                enum Result<T, E> {
-                    Ok(T),
-                    Err(E),
-                }
+    fn result_match() {
+        check_edit(
+            "match",
+            r#"
+enum Result<T, E> { Ok(T), Err(E) }
 
-                fn main() {
-                    let bar = Result::Ok(true);
-                    bar.<|>
-                }
-                "#,
-            ),
-            @r###"
-        [
-            CompletionItem {
-                label: "box",
-                source_range: 211..211,
-                delete: 207..211,
-                insert: "Box::new(bar)",
-                detail: "Box::new(expr)",
-            },
-            CompletionItem {
-                label: "call",
-                source_range: 211..211,
-                delete: 207..211,
-                insert: "${1}(bar)",
-                detail: "function(expr)",
-            },
-            CompletionItem {
-                label: "dbg",
-                source_range: 211..211,
-                delete: 207..211,
-                insert: "dbg!(bar)",
-                detail: "dbg!(expr)",
-            },
-            CompletionItem {
-                label: "ifl",
-                source_range: 211..211,
-                delete: 207..211,
-                insert: "if let Ok($1) = bar {\n    $0\n}",
-                detail: "if let Ok {}",
-            },
-            CompletionItem {
-                label: "match",
-                source_range: 211..211,
-                delete: 207..211,
-                insert: "match bar {\n    Ok(${1:_}) => {$2\\},\n    Err(${3:_}) => {$0\\},\n}",
-                detail: "match expr {}",
-            },
-            CompletionItem {
-                label: "not",
-                source_range: 211..211,
-                delete: 207..211,
-                insert: "!bar",
-                detail: "!expr",
-            },
-            CompletionItem {
-                label: "ref",
-                source_range: 211..211,
-                delete: 207..211,
-                insert: "&bar",
-                detail: "&expr",
-            },
-            CompletionItem {
-                label: "refm",
-                source_range: 211..211,
-                delete: 207..211,
-                insert: "&mut bar",
-                detail: "&mut expr",
-            },
-            CompletionItem {
-                label: "while",
-                source_range: 211..211,
-                delete: 207..211,
-                insert: "while let Ok($1) = bar {\n    $0\n}",
-                detail: "while let Ok {}",
-            },
-        ]
-        "###
-        );
-    }
+fn main() {
+    let bar = Result::Ok(true);
+    bar.<|>
+}
+"#,
+            r#"
+enum Result<T, E> { Ok(T), Err(E) }
 
-    #[test]
-    fn some_postfix_completions_ignored() {
-        assert_debug_snapshot!(
-            do_postfix_completion(
-                r#"
-                fn main() {
-                    let bar: u8 = 12;
-                    bar.<|>
-                }
-                "#,
-            ),
-            @r###"
-        [
-            CompletionItem {
-                label: "box",
-                source_range: 91..91,
-                delete: 87..91,
-                insert: "Box::new(bar)",
-                detail: "Box::new(expr)",
-            },
-            CompletionItem {
-                label: "call",
-                source_range: 91..91,
-                delete: 87..91,
-                insert: "${1}(bar)",
-                detail: "function(expr)",
-            },
-            CompletionItem {
-                label: "dbg",
-                source_range: 91..91,
-                delete: 87..91,
-                insert: "dbg!(bar)",
-                detail: "dbg!(expr)",
-            },
-            CompletionItem {
-                label: "match",
-                source_range: 91..91,
-                delete: 87..91,
-                insert: "match bar {\n    ${1:_} => {$0\\},\n}",
-                detail: "match expr {}",
-            },
-            CompletionItem {
-                label: "not",
-                source_range: 91..91,
-                delete: 87..91,
-                insert: "!bar",
-                detail: "!expr",
-            },
-            CompletionItem {
-                label: "ref",
-                source_range: 91..91,
-                delete: 87..91,
-                insert: "&bar",
-                detail: "&expr",
-            },
-            CompletionItem {
-                label: "refm",
-                source_range: 91..91,
-                delete: 87..91,
-                insert: "&mut bar",
-                detail: "&mut expr",
-            },
-        ]
-        "###
+fn main() {
+    let bar = Result::Ok(true);
+    match bar {
+    Ok(${1:_}) => {$2},
+    Err(${3:_}) => {$0},
+}
+}
+"#,
         );
     }
 
     #[test]
     fn postfix_completion_works_for_ambiguous_float_literal() {
-        assert_debug_snapshot!(
-            do_postfix_completion(
-                r#"
-                fn main() {
-                    42.<|>
-                }
-                "#,
-            ),
-            @r###"
-        [
-            CompletionItem {
-                label: "box",
-                source_range: 52..52,
-                delete: 49..52,
-                insert: "Box::new(42)",
-                detail: "Box::new(expr)",
-            },
-            CompletionItem {
-                label: "call",
-                source_range: 52..52,
-                delete: 49..52,
-                insert: "${1}(42)",
-                detail: "function(expr)",
-            },
-            CompletionItem {
-                label: "dbg",
-                source_range: 52..52,
-                delete: 49..52,
-                insert: "dbg!(42)",
-                detail: "dbg!(expr)",
-            },
-            CompletionItem {
-                label: "match",
-                source_range: 52..52,
-                delete: 49..52,
-                insert: "match 42 {\n    ${1:_} => {$0\\},\n}",
-                detail: "match expr {}",
-            },
-            CompletionItem {
-                label: "not",
-                source_range: 52..52,
-                delete: 49..52,
-                insert: "!42",
-                detail: "!expr",
-            },
-            CompletionItem {
-                label: "ref",
-                source_range: 52..52,
-                delete: 49..52,
-                insert: "&42",
-                detail: "&expr",
-            },
-            CompletionItem {
-                label: "refm",
-                source_range: 52..52,
-                delete: 49..52,
-                insert: "&mut 42",
-                detail: "&mut expr",
-            },
-        ]
-        "###
-        );
+        check_edit("refm", r#"fn main() { 42.<|> }"#, r#"fn main() { &mut 42 }"#)
     }
 
     #[test]
     fn works_in_simple_macro() {
-        assert_debug_snapshot!(
-            do_postfix_completion(
-                r#"
-                macro_rules! m { ($e:expr) => { $e } }
-                fn main() {
-                    let bar: u8 = 12;
-                    m!(bar.b<|>)
-                }
-                "#,
-            ),
-            @r###"
-        [
-            CompletionItem {
-                label: "box",
-                source_range: 149..150,
-                delete: 145..150,
-                insert: "Box::new(bar)",
-                detail: "Box::new(expr)",
-            },
-            CompletionItem {
-                label: "call",
-                source_range: 149..150,
-                delete: 145..150,
-                insert: "${1}(bar)",
-                detail: "function(expr)",
-            },
-            CompletionItem {
-                label: "dbg",
-                source_range: 149..150,
-                delete: 145..150,
-                insert: "dbg!(bar)",
-                detail: "dbg!(expr)",
-            },
-            CompletionItem {
-                label: "match",
-                source_range: 149..150,
-                delete: 145..150,
-                insert: "match bar {\n    ${1:_} => {$0\\},\n}",
-                detail: "match expr {}",
-            },
-            CompletionItem {
-                label: "not",
-                source_range: 149..150,
-                delete: 145..150,
-                insert: "!bar",
-                detail: "!expr",
-            },
-            CompletionItem {
-                label: "ref",
-                source_range: 149..150,
-                delete: 145..150,
-                insert: "&bar",
-                detail: "&expr",
-            },
-            CompletionItem {
-                label: "refm",
-                source_range: 149..150,
-                delete: 145..150,
-                insert: "&mut bar",
-                detail: "&mut expr",
-            },
-        ]
-        "###
+        check_edit(
+            "dbg",
+            r#"
+macro_rules! m { ($e:expr) => { $e } }
+fn main() {
+    let bar: u8 = 12;
+    m!(bar.d<|>)
+}
+"#,
+            r#"
+macro_rules! m { ($e:expr) => { $e } }
+fn main() {
+    let bar: u8 = 12;
+    m!(dbg!(bar))
+}
+"#,
         );
     }
 
     #[test]
     fn postfix_completion_for_references() {
-        assert_debug_snapshot!(
-            do_postfix_completion(
-                r#"
-                fn main() {
-                    &&&&42.<|>
-                }
-                "#,
-            ),
-            @r###"
-        [
-            CompletionItem {
-                label: "box",
-                source_range: 56..56,
-                delete: 49..56,
-                insert: "Box::new(&&&&42)",
-                detail: "Box::new(expr)",
-            },
-            CompletionItem {
-                label: "call",
-                source_range: 56..56,
-                delete: 49..56,
-                insert: "${1}(&&&&42)",
-                detail: "function(expr)",
-            },
-            CompletionItem {
-                label: "dbg",
-                source_range: 56..56,
-                delete: 49..56,
-                insert: "dbg!(&&&&42)",
-                detail: "dbg!(expr)",
-            },
-            CompletionItem {
-                label: "match",
-                source_range: 56..56,
-                delete: 49..56,
-                insert: "match &&&&42 {\n    ${1:_} => {$0\\},\n}",
-                detail: "match expr {}",
-            },
-            CompletionItem {
-                label: "not",
-                source_range: 56..56,
-                delete: 53..56,
-                insert: "!42",
-                detail: "!expr",
-            },
-            CompletionItem {
-                label: "ref",
-                source_range: 56..56,
-                delete: 53..56,
-                insert: "&42",
-                detail: "&expr",
-            },
-            CompletionItem {
-                label: "refm",
-                source_range: 56..56,
-                delete: 53..56,
-                insert: "&mut 42",
-                detail: "&mut expr",
-            },
-        ]
-        "###
-        );
+        check_edit("dbg", r#"fn main() { &&42.<|> }"#, r#"fn main() { dbg!(&&42) }"#);
+        check_edit("refm", r#"fn main() { &&42.<|> }"#, r#"fn main() { &&&mut 42 }"#);
     }
 }

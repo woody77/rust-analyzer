@@ -1,99 +1,91 @@
-use insta::assert_snapshot;
+use expect::expect;
 
-use super::{infer_with_mismatches, type_at};
+use super::{check_infer_with_mismatches, check_types};
 
 #[test]
 fn infer_never1() {
-    let t = type_at(
+    check_types(
         r#"
-//- /main.rs
 fn test() {
     let t = return;
-    t<|>;
-}
+    t;
+} //^ !
 "#,
     );
-    assert_eq!(t, "!");
 }
 
 #[test]
 fn infer_never2() {
-    let t = type_at(
+    check_types(
         r#"
-//- /main.rs
 fn gen<T>() -> T { loop {} }
 
 fn test() {
     let a = gen();
     if false { a } else { loop {} };
-    a<|>;
-}
+    a;
+} //^ !
 "#,
     );
-    assert_eq!(t, "!");
 }
 
 #[test]
 fn infer_never3() {
-    let t = type_at(
+    check_types(
         r#"
-//- /main.rs
 fn gen<T>() -> T { loop {} }
 
 fn test() {
     let a = gen();
     if false { loop {} } else { a };
-    a<|>;
+    a;
+  //^ !
 }
 "#,
     );
-    assert_eq!(t, "!");
 }
 
 #[test]
 fn never_type_in_generic_args() {
-    let t = type_at(
+    check_types(
         r#"
-//- /main.rs
 enum Option<T> { None, Some(T) }
 
 fn test() {
     let a = if true { Option::None } else { Option::Some(return) };
-    a<|>;
-}
+    a;
+} //^ Option<!>
 "#,
     );
-    assert_eq!(t, "Option<!>");
 }
 
 #[test]
 fn never_type_can_be_reinferred1() {
-    let t = type_at(
+    check_types(
         r#"
-//- /main.rs
 fn gen<T>() -> T { loop {} }
 
 fn test() {
     let a = gen();
     if false { loop {} } else { a };
-    a<|>;
+    a;
+  //^ ()
     if false { a };
 }
 "#,
     );
-    assert_eq!(t, "()");
 }
 
 #[test]
 fn never_type_can_be_reinferred2() {
-    let t = type_at(
+    check_types(
         r#"
-//- /main.rs
 enum Option<T> { None, Some(T) }
 
 fn test() {
     let a = if true { Option::None } else { Option::Some(return) };
-    a<|>;
+    a;
+  //^ Option<i32>
     match 42 {
         42 => a,
         _ => Option::Some(42),
@@ -101,19 +93,18 @@ fn test() {
 }
 "#,
     );
-    assert_eq!(t, "Option<i32>");
 }
 
 #[test]
 fn never_type_can_be_reinferred3() {
-    let t = type_at(
+    check_types(
         r#"
-//- /main.rs
 enum Option<T> { None, Some(T) }
 
 fn test() {
     let a = if true { Option::None } else { Option::Some(return) };
-    a<|>;
+    a;
+  //^ Option<&str>
     match 42 {
         42 => a,
         _ => Option::Some("str"),
@@ -121,82 +112,72 @@ fn test() {
 }
 "#,
     );
-    assert_eq!(t, "Option<&str>");
 }
 
 #[test]
 fn match_no_arm() {
-    let t = type_at(
+    check_types(
         r#"
-//- /main.rs
 enum Void {}
 
 fn test(a: Void) {
     let t = match a {};
-    t<|>;
-}
+    t;
+} //^ !
 "#,
     );
-    assert_eq!(t, "!");
 }
 
 #[test]
 fn match_unknown_arm() {
-    let t = type_at(
+    check_types(
         r#"
-//- /main.rs
 fn test(a: Option) {
     let t = match 0 {
         _ => unknown,
     };
-    t<|>;
-}
+    t;
+} //^ {unknown}
 "#,
     );
-    assert_eq!(t, "{unknown}");
 }
 
 #[test]
 fn if_never() {
-    let t = type_at(
+    check_types(
         r#"
-//- /main.rs
 fn test() {
     let i = if true {
         loop {}
     } else {
         3.0
     };
-    i<|>;
-}
+    i;
+} //^ f64
 "#,
     );
-    assert_eq!(t, "f64");
 }
 
 #[test]
 fn if_else_never() {
-    let t = type_at(
+    check_types(
         r#"
-//- /main.rs
 fn test(input: bool) {
     let i = if input {
         2.0
     } else {
         return
     };
-    i<|>;
-}
+    i;
+} //^ f64
 "#,
     );
-    assert_eq!(t, "f64");
 }
 
 #[test]
 fn match_first_arm_never() {
-    let t = type_at(
+    check_types(
         r#"
-//- /main.rs
 fn test(a: i32) {
     let i = match a {
         1 => return,
@@ -204,18 +185,16 @@ fn test(a: i32) {
         3 => loop {},
         _ => 3.0,
     };
-    i<|>;
-}
+    i;
+} //^ f64
 "#,
     );
-    assert_eq!(t, "f64");
 }
 
 #[test]
 fn match_second_arm_never() {
-    let t = type_at(
+    check_types(
         r#"
-//- /main.rs
 fn test(a: i32) {
     let i = match a {
         1 => 3.0,
@@ -223,216 +202,208 @@ fn test(a: i32) {
         3 => 3.0,
         _ => return,
     };
-    i<|>;
-}
+    i;
+} //^ f64
 "#,
     );
-    assert_eq!(t, "f64");
 }
 
 #[test]
 fn match_all_arms_never() {
-    let t = type_at(
+    check_types(
         r#"
-//- /main.rs
 fn test(a: i32) {
     let i = match a {
         2 => return,
         _ => loop {},
     };
-    i<|>;
-}
+    i;
+} //^ !
 "#,
     );
-    assert_eq!(t, "!");
 }
 
 #[test]
 fn match_no_never_arms() {
-    let t = type_at(
+    check_types(
         r#"
-//- /main.rs
 fn test(a: i32) {
     let i = match a {
         2 => 2.0,
         _ => 3.0,
     };
-    i<|>;
-}
+    i;
+} //^ f64
 "#,
     );
-    assert_eq!(t, "f64");
 }
 
 #[test]
 fn diverging_expression_1() {
-    let t = infer_with_mismatches(
-        r#"
-//- /main.rs
-fn test1() {
-    let x: u32 = return;
-}
-fn test2() {
-    let x: u32 = { return; };
-}
-fn test3() {
-    let x: u32 = loop {};
-}
-fn test4() {
-    let x: u32 = { loop {} };
-}
-fn test5() {
-    let x: u32 = { if true { loop {}; } else { loop {}; } };
-}
-fn test6() {
-    let x: u32 = { let y: u32 = { loop {}; }; };
-}
-"#,
-        true,
+    check_infer_with_mismatches(
+        r"
+        //- /main.rs
+        fn test1() {
+            let x: u32 = return;
+        }
+        fn test2() {
+            let x: u32 = { return; };
+        }
+        fn test3() {
+            let x: u32 = loop {};
+        }
+        fn test4() {
+            let x: u32 = { loop {} };
+        }
+        fn test5() {
+            let x: u32 = { if true { loop {}; } else { loop {}; } };
+        }
+        fn test6() {
+            let x: u32 = { let y: u32 = { loop {}; }; };
+        }
+        ",
+        expect![[r"
+            11..39 '{     ...urn; }': ()
+            21..22 'x': u32
+            30..36 'return': !
+            51..84 '{     ...; }; }': ()
+            61..62 'x': u32
+            70..81 '{ return; }': u32
+            72..78 'return': !
+            96..125 '{     ... {}; }': ()
+            106..107 'x': u32
+            115..122 'loop {}': !
+            120..122 '{}': ()
+            137..170 '{     ...} }; }': ()
+            147..148 'x': u32
+            156..167 '{ loop {} }': u32
+            158..165 'loop {}': !
+            163..165 '{}': ()
+            182..246 '{     ...} }; }': ()
+            192..193 'x': u32
+            201..243 '{ if t...}; } }': u32
+            203..241 'if tru... {}; }': u32
+            206..210 'true': bool
+            211..223 '{ loop {}; }': u32
+            213..220 'loop {}': !
+            218..220 '{}': ()
+            229..241 '{ loop {}; }': u32
+            231..238 'loop {}': !
+            236..238 '{}': ()
+            258..310 '{     ...; }; }': ()
+            268..269 'x': u32
+            277..307 '{ let ...; }; }': u32
+            283..284 'y': u32
+            292..304 '{ loop {}; }': u32
+            294..301 'loop {}': !
+            299..301 '{}': ()
+        "]],
     );
-    assert_snapshot!(t, @r###"
-    25..53 '{     ...urn; }': ()
-    35..36 'x': u32
-    44..50 'return': !
-    65..98 '{     ...; }; }': ()
-    75..76 'x': u32
-    84..95 '{ return; }': u32
-    86..92 'return': !
-    110..139 '{     ... {}; }': ()
-    120..121 'x': u32
-    129..136 'loop {}': !
-    134..136 '{}': ()
-    151..184 '{     ...} }; }': ()
-    161..162 'x': u32
-    170..181 '{ loop {} }': u32
-    172..179 'loop {}': !
-    177..179 '{}': ()
-    196..260 '{     ...} }; }': ()
-    206..207 'x': u32
-    215..257 '{ if t...}; } }': u32
-    217..255 'if tru... {}; }': u32
-    220..224 'true': bool
-    225..237 '{ loop {}; }': u32
-    227..234 'loop {}': !
-    232..234 '{}': ()
-    243..255 '{ loop {}; }': u32
-    245..252 'loop {}': !
-    250..252 '{}': ()
-    272..324 '{     ...; }; }': ()
-    282..283 'x': u32
-    291..321 '{ let ...; }; }': u32
-    297..298 'y': u32
-    306..318 '{ loop {}; }': u32
-    308..315 'loop {}': !
-    313..315 '{}': ()
-    "###);
 }
 
 #[test]
 fn diverging_expression_2() {
-    let t = infer_with_mismatches(
+    check_infer_with_mismatches(
         r#"
-//- /main.rs
-fn test1() {
-    // should give type mismatch
-    let x: u32 = { loop {}; "foo" };
-}
-"#,
-        true,
+        //- /main.rs
+        fn test1() {
+            // should give type mismatch
+            let x: u32 = { loop {}; "foo" };
+        }
+        "#,
+        expect![[r#"
+            11..84 '{     ..." }; }': ()
+            54..55 'x': u32
+            63..81 '{ loop...foo" }': &str
+            65..72 'loop {}': !
+            70..72 '{}': ()
+            74..79 '"foo"': &str
+            63..81: expected u32, got &str
+            74..79: expected u32, got &str
+        "#]],
     );
-    assert_snapshot!(t, @r###"
-    25..98 '{     ..." }; }': ()
-    68..69 'x': u32
-    77..95 '{ loop...foo" }': &str
-    79..86 'loop {}': !
-    84..86 '{}': ()
-    88..93 '"foo"': &str
-    77..95: expected u32, got &str
-    88..93: expected u32, got &str
-    "###);
 }
 
 #[test]
 fn diverging_expression_3_break() {
-    let t = infer_with_mismatches(
-        r#"
-//- /main.rs
-fn test1() {
-    // should give type mismatch
-    let x: u32 = { loop { break; } };
-}
-fn test2() {
-    // should give type mismatch
-    let x: u32 = { for a in b { break; }; };
-    // should give type mismatch as well
-    let x: u32 = { for a in b {}; };
-    // should give type mismatch as well
-    let x: u32 = { for a in b { return; }; };
-}
-fn test3() {
-    // should give type mismatch
-    let x: u32 = { while true { break; }; };
-    // should give type mismatch as well -- there's an implicit break, even if it's never hit
-    let x: u32 = { while true {}; };
-    // should give type mismatch as well
-    let x: u32 = { while true { return; }; };
-}
-"#,
-        true,
+    check_infer_with_mismatches(
+        r"
+        //- /main.rs
+        fn test1() {
+            // should give type mismatch
+            let x: u32 = { loop { break; } };
+        }
+        fn test2() {
+            // should give type mismatch
+            let x: u32 = { for a in b { break; }; };
+            // should give type mismatch as well
+            let x: u32 = { for a in b {}; };
+            // should give type mismatch as well
+            let x: u32 = { for a in b { return; }; };
+        }
+        fn test3() {
+            // should give type mismatch
+            let x: u32 = { while true { break; }; };
+            // should give type mismatch as well -- there's an implicit break, even if it's never hit
+            let x: u32 = { while true {}; };
+            // should give type mismatch as well
+            let x: u32 = { while true { return; }; };
+        }
+        ",
+        expect![[r"
+            11..85 '{     ...} }; }': ()
+            54..55 'x': u32
+            63..82 '{ loop...k; } }': ()
+            65..80 'loop { break; }': ()
+            70..80 '{ break; }': ()
+            72..77 'break': !
+            63..82: expected u32, got ()
+            65..80: expected u32, got ()
+            97..343 '{     ...; }; }': ()
+            140..141 'x': u32
+            149..175 '{ for ...; }; }': ()
+            151..172 'for a ...eak; }': ()
+            155..156 'a': {unknown}
+            160..161 'b': {unknown}
+            162..172 '{ break; }': ()
+            164..169 'break': !
+            226..227 'x': u32
+            235..253 '{ for ... {}; }': ()
+            237..250 'for a in b {}': ()
+            241..242 'a': {unknown}
+            246..247 'b': {unknown}
+            248..250 '{}': ()
+            304..305 'x': u32
+            313..340 '{ for ...; }; }': ()
+            315..337 'for a ...urn; }': ()
+            319..320 'a': {unknown}
+            324..325 'b': {unknown}
+            326..337 '{ return; }': ()
+            328..334 'return': !
+            149..175: expected u32, got ()
+            235..253: expected u32, got ()
+            313..340: expected u32, got ()
+            355..654 '{     ...; }; }': ()
+            398..399 'x': u32
+            407..433 '{ whil...; }; }': ()
+            409..430 'while ...eak; }': ()
+            415..419 'true': bool
+            420..430 '{ break; }': ()
+            422..427 'break': !
+            537..538 'x': u32
+            546..564 '{ whil... {}; }': ()
+            548..561 'while true {}': ()
+            554..558 'true': bool
+            559..561 '{}': ()
+            615..616 'x': u32
+            624..651 '{ whil...; }; }': ()
+            626..648 'while ...urn; }': ()
+            632..636 'true': bool
+            637..648 '{ return; }': ()
+            639..645 'return': !
+            407..433: expected u32, got ()
+            546..564: expected u32, got ()
+            624..651: expected u32, got ()
+        "]],
     );
-    assert_snapshot!(t, @r###"
-    25..99 '{     ...} }; }': ()
-    68..69 'x': u32
-    77..96 '{ loop...k; } }': ()
-    79..94 'loop { break; }': ()
-    84..94 '{ break; }': ()
-    86..91 'break': !
-    77..96: expected u32, got ()
-    79..94: expected u32, got ()
-    111..357 '{     ...; }; }': ()
-    154..155 'x': u32
-    163..189 '{ for ...; }; }': ()
-    165..186 'for a ...eak; }': ()
-    169..170 'a': {unknown}
-    174..175 'b': {unknown}
-    176..186 '{ break; }': ()
-    178..183 'break': !
-    240..241 'x': u32
-    249..267 '{ for ... {}; }': ()
-    251..264 'for a in b {}': ()
-    255..256 'a': {unknown}
-    260..261 'b': {unknown}
-    262..264 '{}': ()
-    318..319 'x': u32
-    327..354 '{ for ...; }; }': ()
-    329..351 'for a ...urn; }': ()
-    333..334 'a': {unknown}
-    338..339 'b': {unknown}
-    340..351 '{ return; }': ()
-    342..348 'return': !
-    163..189: expected u32, got ()
-    249..267: expected u32, got ()
-    327..354: expected u32, got ()
-    369..668 '{     ...; }; }': ()
-    412..413 'x': u32
-    421..447 '{ whil...; }; }': ()
-    423..444 'while ...eak; }': ()
-    429..433 'true': bool
-    434..444 '{ break; }': ()
-    436..441 'break': !
-    551..552 'x': u32
-    560..578 '{ whil... {}; }': ()
-    562..575 'while true {}': ()
-    568..572 'true': bool
-    573..575 '{}': ()
-    629..630 'x': u32
-    638..665 '{ whil...; }; }': ()
-    640..662 'while ...urn; }': ()
-    646..650 'true': bool
-    651..662 '{ return; }': ()
-    653..659 'return': !
-    421..447: expected u32, got ()
-    560..578: expected u32, got ()
-    638..665: expected u32, got ()
-    "###);
 }

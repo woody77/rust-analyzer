@@ -110,46 +110,15 @@ pub(super) fn all_super_trait_refs(db: &dyn HirDatabase, trait_ref: TraitRef) ->
     result
 }
 
-/// Finds a path from a trait to one of its super traits. Returns an empty
-/// vector if there is no path.
-pub(super) fn find_super_trait_path(
-    db: &dyn DefDatabase,
-    trait_: TraitId,
-    super_trait: TraitId,
-) -> Vec<TraitId> {
-    let mut result = Vec::with_capacity(2);
-    result.push(trait_);
-    return if go(db, super_trait, &mut result) { result } else { Vec::new() };
-
-    fn go(db: &dyn DefDatabase, super_trait: TraitId, path: &mut Vec<TraitId>) -> bool {
-        let trait_ = *path.last().unwrap();
-        if trait_ == super_trait {
-            return true;
-        }
-
-        for tt in direct_super_traits(db, trait_) {
-            if path.contains(&tt) {
-                continue;
-            }
-            path.push(tt);
-            if go(db, super_trait, path) {
-                return true;
-            } else {
-                path.pop();
-            }
-        }
-        false
-    }
-}
-
 pub(super) fn associated_type_by_name_including_super_traits(
-    db: &dyn DefDatabase,
-    trait_: TraitId,
+    db: &dyn HirDatabase,
+    trait_ref: TraitRef,
     name: &Name,
-) -> Option<TypeAliasId> {
-    all_super_traits(db, trait_)
-        .into_iter()
-        .find_map(|t| db.trait_data(t).associated_type_by_name(name))
+) -> Option<(TraitRef, TypeAliasId)> {
+    all_super_trait_refs(db, trait_ref).into_iter().find_map(|t| {
+        let assoc_type = db.trait_data(t.trait_).associated_type_by_name(name)?;
+        Some((t, assoc_type))
+    })
 }
 
 pub(super) fn variant_data(db: &dyn DefDatabase, var: VariantId) -> Arc<VariantData> {
@@ -176,6 +145,7 @@ pub(crate) fn generics(db: &dyn DefDatabase, def: GenericDefId) -> Generics {
     Generics { def, params: db.generic_params(def), parent_generics }
 }
 
+#[derive(Debug)]
 pub(crate) struct Generics {
     def: GenericDefId,
     pub(crate) params: Arc<GenericParams>,

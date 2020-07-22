@@ -189,6 +189,21 @@ impl ast::RecordFieldList {
     }
 }
 
+impl ast::TypeAliasDef {
+    #[must_use]
+    pub fn remove_bounds(&self) -> ast::TypeAliasDef {
+        let colon = match self.colon_token() {
+            Some(it) => it,
+            None => return self.clone(),
+        };
+        let end = match self.type_bound_list() {
+            Some(it) => it.syntax().clone().into(),
+            None => colon.clone().into(),
+        };
+        self.replace_children(colon.into()..=end, iter::empty())
+    }
+}
+
 impl ast::TypeParam {
     #[must_use]
     pub fn remove_bounds(&self) -> ast::TypeParam {
@@ -299,12 +314,8 @@ impl ast::UseTree {
             Some(it) => it,
             None => return self.clone(),
         };
-        let use_tree = make::use_tree(
-            suffix.clone(),
-            self.use_tree_list(),
-            self.alias(),
-            self.star_token().is_some(),
-        );
+        let use_tree =
+            make::use_tree(suffix, self.use_tree_list(), self.alias(), self.star_token().is_some());
         let nested = make::use_tree_list(iter::once(use_tree));
         return make::use_tree(prefix.clone(), Some(nested), None, false);
 
@@ -579,12 +590,17 @@ pub trait AstNodeEdit: AstNode + Clone + Sized {
         rewriter.rewrite_ast(self)
     }
     #[must_use]
-    fn indent(&self, indent: IndentLevel) -> Self {
-        Self::cast(indent.increase_indent(self.syntax().clone())).unwrap()
+    fn indent(&self, level: IndentLevel) -> Self {
+        Self::cast(level.increase_indent(self.syntax().clone())).unwrap()
     }
     #[must_use]
-    fn dedent(&self, indent: IndentLevel) -> Self {
-        Self::cast(indent.decrease_indent(self.syntax().clone())).unwrap()
+    fn dedent(&self, level: IndentLevel) -> Self {
+        Self::cast(level.decrease_indent(self.syntax().clone())).unwrap()
+    }
+    #[must_use]
+    fn reset_indent(&self) -> Self {
+        let level = IndentLevel::from_node(self.syntax());
+        self.dedent(level)
     }
 }
 

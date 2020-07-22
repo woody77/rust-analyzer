@@ -1,6 +1,9 @@
 //! There are many AstNodes, but only a few tokens, so we hand-write them here.
 
-use std::convert::{TryFrom, TryInto};
+use std::{
+    borrow::Cow,
+    convert::{TryFrom, TryInto},
+};
 
 use crate::{
     ast::{AstToken, Comment, RawString, String, Whitespace},
@@ -84,7 +87,7 @@ impl Whitespace {
 }
 
 pub struct QuoteOffsets {
-    pub quotes: [TextRange; 2],
+    pub quotes: (TextRange, TextRange),
     pub contents: TextRange,
 }
 
@@ -103,7 +106,7 @@ impl QuoteOffsets {
         let end = TextSize::of(literal);
 
         let res = QuoteOffsets {
-            quotes: [TextRange::new(start, left_quote), TextRange::new(right_quote, end)],
+            quotes: (TextRange::new(start, left_quote), TextRange::new(right_quote, end)),
             contents: TextRange::new(left_quote, right_quote),
         };
         Some(res)
@@ -116,17 +119,17 @@ pub trait HasQuotes: AstToken {
         let offsets = QuoteOffsets::new(text)?;
         let o = self.syntax().text_range().start();
         let offsets = QuoteOffsets {
-            quotes: [offsets.quotes[0] + o, offsets.quotes[1] + o],
+            quotes: (offsets.quotes.0 + o, offsets.quotes.1 + o),
             contents: offsets.contents + o,
         };
         Some(offsets)
     }
     fn open_quote_text_range(&self) -> Option<TextRange> {
-        self.quote_offsets().map(|it| it.quotes[0])
+        self.quote_offsets().map(|it| it.quotes.0)
     }
 
     fn close_quote_text_range(&self) -> Option<TextRange> {
-        self.quote_offsets().map(|it| it.quotes[1])
+        self.quote_offsets().map(|it| it.quotes.1)
     }
 
     fn text_range_between_quotes(&self) -> Option<TextRange> {
@@ -138,11 +141,11 @@ impl HasQuotes for String {}
 impl HasQuotes for RawString {}
 
 pub trait HasStringValue: HasQuotes {
-    fn value(&self) -> Option<std::string::String>;
+    fn value(&self) -> Option<Cow<'_, str>>;
 }
 
 impl HasStringValue for String {
-    fn value(&self) -> Option<std::string::String> {
+    fn value(&self) -> Option<Cow<'_, str>> {
         let text = self.text().as_str();
         let text = &text[self.text_range_between_quotes()? - self.syntax().text_range().start()];
 
@@ -156,15 +159,17 @@ impl HasStringValue for String {
         if has_error {
             return None;
         }
-        Some(buf)
+        // FIXME: don't actually allocate for borrowed case
+        let res = if buf == text { Cow::Borrowed(text) } else { Cow::Owned(buf) };
+        Some(res)
     }
 }
 
 impl HasStringValue for RawString {
-    fn value(&self) -> Option<std::string::String> {
+    fn value(&self) -> Option<Cow<'_, str>> {
         let text = self.text().as_str();
         let text = &text[self.text_range_between_quotes()? - self.syntax().text_range().start()];
-        Some(text.to_string())
+        Some(Cow::Borrowed(text))
     }
 }
 
@@ -335,16 +340,26 @@ pub trait HasFormatSpecifier: AstToken {
                             }
                             c if c == '_' || c.is_alphabetic() => {
                                 read_identifier(&mut chars, &mut callback);
-                                if chars.peek().and_then(|next| next.1.as_ref().ok()).copied()
-                                    != Some('$')
-                                {
-                                    continue;
-                                }
-                                skip_char_and_emit(
-                                    &mut chars,
-                                    FormatSpecifier::DollarSign,
-                                    &mut callback,
-                                );
+                                // can be either width (indicated by dollar sign, or type in which case
+                                // the next sign has to be `}`)
+                                let next =
+                                    chars.peek().and_then(|next| next.1.as_ref().ok()).copied();
+                                match next {
+                                    Some('$') => skip_char_and_emit(
+                                        &mut chars,
+                                        FormatSpecifier::DollarSign,
+                                        &mut callback,
+                                    ),
+                                    Some('}') => {
+                                        skip_char_and_emit(
+                                            &mut chars,
+                                            FormatSpecifier::Close,
+                                            &mut callback,
+                                        );
+                                        continue;
+                                    }
+                                    _ => continue,
+                                };
                             }
                             _ => {}
                         }
@@ -416,12 +431,11 @@ pub trait HasFormatSpecifier: AstToken {
                         }
                     }
 
-                    let mut cloned = chars.clone().take(2);
-                    let first = cloned.next().and_then(|next| next.1.as_ref().ok()).copied();
-                    if first != Some('}') {
+                    if let Some((_, Ok('}'))) = chars.peek() {
+                        skip_char_and_emit(&mut chars, FormatSpecifier::Close, &mut callback);
+                    } else {
                         continue;
                     }
-                    skip_char_and_emit(&mut chars, FormatSpecifier::Close, &mut callback);
                 }
                 _ => {
                     while let Some((_, Ok(next_char))) = chars.peek() {

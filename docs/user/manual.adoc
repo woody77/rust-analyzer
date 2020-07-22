@@ -13,8 +13,12 @@ This manual focuses on a specific usage of the library -- running it as part of 
 https://microsoft.github.io/language-server-protocol/[Language Server Protocol] (LSP).
 The LSP allows various code editors, like VS Code, Emacs or Vim, to implement semantic features like completion or goto definition by talking to an external language server process.
 
-To improve this document, send a pull request against
-https://github.com/rust-analyzer/rust-analyzer/blob/master/docs/user/manual.adoc[this file].
+[TIP]
+====
+[.lead]
+To improve this document, send a pull request: +
+https://github.com/rust-analyzer/rust-analyzer/blob/master/docs/user/manual.adoc[https://github.com/rust-analyzer/.../manual.adoc]
+====
 
 If you have questions about using rust-analyzer, please ask them in the https://users.rust-lang.org/c/ide/14["`IDEs and Editors`"] topic of Rust users forum.
 
@@ -57,7 +61,7 @@ To disable this notification put the following to `settings.json`
 The server binary is stored in:
 
 * Linux: `~/.config/Code/User/globalStorage/matklad.rust-analyzer`
-* macOS: `~/Library/Application Support/Code/User/globalStorage/matklad.rust-analyzer`
+* macOS: `~/Library/Application\ Support/Code/User/globalStorage/matklad.rust-analyzer`
 * Windows: `%APPDATA%\Code\User\globalStorage\matklad.rust-analyzer`
 
 Note that we only support two most recent versions of VS Code.
@@ -108,18 +112,6 @@ Here are some useful self-diagnostic commands:
 * To enable server-side logging, run with `env RA_LOG=info` and see `Output > Rust Analyzer Language Server` in VS Code's panel.
 * To log all LSP requests, add `"rust-analyzer.trace.server": "verbose"` to the settings and look for `Server Trace` in the panel.
 * To enable client-side logging, add `"rust-analyzer.trace.extension": true` to the settings and open the `Console` tab of VS Code developer tools.
-
-==== Special `when` clause context for keybindings.
-You may use `inRustProject` context to configure keybindings for rust projects only. For example:
-[source,json]
-----
-{
-  "key": "ctrl+i",
-  "command": "rust-analyzer.toggleInlayHints",
-  "when": "inRustProject"
-}
-----
-More about `when` clause contexts https://code.visualstudio.com/docs/getstarted/keybindings#_when-clause-contexts[here].
 
 === rust-analyzer Language Server Binary
 
@@ -269,6 +261,10 @@ Gnome Builder currently has support for RLS, and there's no way to configure the
 1. Rename, symlink or copy the `rust-analyzer` binary to `rls` and place it somewhere Builder can find (in `PATH`, or under `~/.cargo/bin`).
 2. Enable the Rust Builder plugin.
 
+==== GNOME Builder (Nightly)
+
+https://nightly.gnome.org/repo/appstream/org.gnome.Builder.flatpakref[GNOME Builder (Nightly)] has now native support for `rust-analyzer` out of the box. If the `rust-analyzer` binary is not available, GNOME Builder can install it when opening a Rust source file.
+
 == Non-Cargo Based Projects
 
 rust-analyzer does not require Cargo.
@@ -318,6 +314,8 @@ There are tree ways to feed `rust-project.json` to rust-analyzer:
 * Specify `"rust-analyzer.linkedProjects": [ "path/to/rust-project.json" ]` in the settings (and make sure that your LSP client sends settings as a part of initialize request).
 * Specify `"rust-analyzer.linkedProjects": [ { "roots": [...], "crates": [...] }]` inline.
 
+Relative paths are interpreted relative to `rust-project.json` file location or (for inline JSON) relative to `rootUri`.
+
 See https://github.com/rust-analyzer/rust-project.json-example for a small example.
 
 == Features
@@ -331,3 +329,66 @@ They are usually triggered by a shortcut or by clicking a light bulb icon in the
 Cursor position or selection is signified by `┃` character.
 
 include::./generated_assists.adoc[]
+
+== Editor Features
+=== VS Code
+==== Special `when` clause context for keybindings.
+You may use `inRustProject` context to configure keybindings for rust projects only. For example:
+[source,json]
+----
+{
+  "key": "ctrl+i",
+  "command": "rust-analyzer.toggleInlayHints",
+  "when": "inRustProject"
+}
+----
+More about `when` clause contexts https://code.visualstudio.com/docs/getstarted/keybindings#_when-clause-contexts[here].
+
+==== Setting runnable environment variables
+You can use "rust-analyzer.runnableEnv" setting to define runnable environment-specific substitution variables.
+The simplest way for all runnables in a bunch:
+```jsonc
+"rust-analyzer.runnableEnv": {
+    "RUN_SLOW_TESTS": "1"
+}
+```
+
+Or it is possible to specify vars more granularly:
+```jsonc
+"rust-analyzer.runnableEnv": [
+    {
+        // "mask": null, // null mask means that this rule will be applied for all runnables
+        env: {
+             "APP_ID": "1",
+             "APP_DATA": "asdf"
+        }
+    },
+    {
+        "mask": "test_name",
+        "env": {
+             "APP_ID": "2", // overwrites only APP_ID
+        }
+    }
+]
+```
+
+You can use any valid RegExp as a mask. Also note that a full runnable name is something like *run bin_or_example_name*, *test some::mod::test_name* or *test-mod some::mod*, so it is possible to distinguish binaries, single tests, and test modules with this masks: `"^run"`, `"^test "` (the trailing space matters!), and `"^test-mod"` respectively.
+
+==== Compiler feedback from external commands
+
+Instead of relying on the built-in `cargo check`, you can configure Code to run a command in the background and use the `$rustc-watch` problem matcher to generate inline error markers from its output.
+
+To do this you need to create a new https://code.visualstudio.com/docs/editor/tasks[VS Code Task] and set `rust-analyzer.checkOnSave.enable: false` in preferences.
+
+For example, if you want to run https://crates.io/crates/cargo-watch[`cargo watch`] instead, you might add the following to `.vscode/tasks.json`:
+
+```json
+{
+    "label": "Watch",
+    "group": "build",
+    "type": "shell",
+    "command": "cargo watch",
+    "problemMatcher": "$rustc-watch",
+    "isBackground": true
+}
+```

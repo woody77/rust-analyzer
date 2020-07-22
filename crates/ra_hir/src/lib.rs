@@ -19,25 +19,6 @@
 
 #![recursion_limit = "512"]
 
-macro_rules! impl_froms {
-    ($e:ident: $($v:ident $(($($sv:ident),*))?),*$(,)?) => {
-        $(
-            impl From<$v> for $e {
-                fn from(it: $v) -> $e {
-                    $e::$v(it)
-                }
-            }
-            $($(
-                impl From<$sv> for $e {
-                    fn from(it: $sv) -> $e {
-                        $e::$v($v::$sv(it))
-                    }
-                }
-            )*)?
-        )*
-    }
-}
-
 mod semantics;
 pub mod db;
 mod source_analyzer;
@@ -51,10 +32,10 @@ mod has_source;
 
 pub use crate::{
     code_model::{
-        Adt, AsAssocItem, AssocItem, AssocItemContainer, AttrDef, Const, Crate, CrateDependency,
-        DefWithBody, Docs, Enum, EnumVariant, Field, FieldSource, Function, GenericDef, HasAttrs,
-        HasVisibility, ImplDef, Local, MacroDef, Module, ModuleDef, ScopeDef, Static, Struct,
-        Trait, Type, TypeAlias, TypeParam, Union, VariantDef, Visibility,
+        Adt, AsAssocItem, AssocItem, AssocItemContainer, AttrDef, Callable, CallableKind, Const,
+        Crate, CrateDependency, DefWithBody, Docs, Enum, EnumVariant, Field, FieldSource, Function,
+        GenericDef, HasAttrs, HasVisibility, ImplDef, Local, MacroDef, Module, ModuleDef, ScopeDef,
+        Static, Struct, Trait, Type, TypeAlias, TypeParam, Union, VariantDef, Visibility,
     },
     has_source::HasSource,
     semantics::{original_range, PathResolution, Semantics, SemanticsScope},
@@ -71,7 +52,8 @@ pub use hir_def::{
     type_ref::Mutability,
 };
 pub use hir_expand::{
-    hygiene::Hygiene, name::Name, HirFileId, InFile, MacroCallId, MacroCallLoc, MacroDefId,
+    hygiene::Hygiene, name::Name, HirFileId, InFile, MacroCallId, MacroCallLoc,
+    MacroDefId, /* FIXME */
     MacroFile, Origin,
 };
-pub use hir_ty::{display::HirDisplay, CallableDef};
+pub use hir_ty::display::HirDisplay;

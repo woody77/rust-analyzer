@@ -125,12 +125,12 @@ mod tests {
     #[test]
     fn test_resolve_crate_root() {
         let mock = MockAnalysis::with_files(
-            "
-        //- /bar.rs
-        mod foo;
-        //- /foo.rs
-        // empty <|>
-    ",
+            r#"
+//- /bar.rs
+mod foo;
+//- /foo.rs
+// empty
+"#,
         );
         let root_file = mock.id_of("/bar.rs");
         let mod_file = mock.id_of("/foo.rs");
@@ -144,7 +144,6 @@ mod tests {
             None,
             CfgOptions::default(),
             Env::default(),
-            Default::default(),
             Default::default(),
         );
         let mut change = AnalysisChange::new();

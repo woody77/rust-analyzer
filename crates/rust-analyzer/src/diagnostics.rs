@@ -1,45 +1,47 @@
 //! Book keeping for keeping diagnostics easily in sync with the client.
 pub(crate) mod to_proto;
 
-use std::{collections::HashMap, sync::Arc};
+use std::{mem, sync::Arc};
 
-use lsp_types::{Diagnostic, Range};
 use ra_ide::FileId;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::lsp_ext;
 
-pub type CheckFixes = Arc<HashMap<FileId, Vec<Fix>>>;
+pub(crate) type CheckFixes = Arc<FxHashMap<FileId, Vec<Fix>>>;
 
 #[derive(Debug, Default, Clone)]
-pub struct DiagnosticCollection {
-    pub native: HashMap<FileId, Vec<Diagnostic>>,
-    pub check: HashMap<FileId, Vec<Diagnostic>>,
-    pub check_fixes: CheckFixes,
+pub struct DiagnosticsConfig {
+    pub warnings_as_info: Vec<String>,
+    pub warnings_as_hint: Vec<String>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub(crate) struct DiagnosticCollection {
+    // FIXME: should be FxHashMap<FileId, Vec<ra_id::Diagnostic>>
+    pub(crate) native: FxHashMap<FileId, Vec<lsp_types::Diagnostic>>,
+    // FIXME: should be Vec<flycheck::Diagnostic>
+    pub(crate) check: FxHashMap<FileId, Vec<lsp_types::Diagnostic>>,
+    pub(crate) check_fixes: CheckFixes,
+    changes: FxHashSet<FileId>,
 }
 
 #[derive(Debug, Clone)]
-pub struct Fix {
-    pub range: Range,
-    pub action: lsp_ext::CodeAction,
-}
-
-#[derive(Debug)]
-pub enum DiagnosticTask {
-    ClearCheck,
-    AddCheck(FileId, Diagnostic, Vec<lsp_ext::CodeAction>),
-    SetNative(FileId, Vec<Diagnostic>),
+pub(crate) struct Fix {
+    pub(crate) range: lsp_types::Range,
+    pub(crate) action: lsp_ext::CodeAction,
 }
 
 impl DiagnosticCollection {
-    pub fn clear_check(&mut self) -> Vec<FileId> {
+    pub(crate) fn clear_check(&mut self) {
         Arc::make_mut(&mut self.check_fixes).clear();
-        self.check.drain().map(|(key, _value)| key).collect()
+        self.changes.extend(self.check.drain().map(|(key, _value)| key))
     }
 
-    pub fn add_check_diagnostic(
+    pub(crate) fn add_check_diagnostic(
         &mut self,
         file_id: FileId,
-        diagnostic: Diagnostic,
+        diagnostic: lsp_types::Diagnostic,
         fixes: Vec<lsp_ext::CodeAction>,
     ) {
         let diagnostics = self.check.entry(file_id).or_default();
@@ -55,34 +57,36 @@ impl DiagnosticCollection {
             .or_default()
             .extend(fixes.into_iter().map(|action| Fix { range: diagnostic.range, action }));
         diagnostics.push(diagnostic);
+        self.changes.insert(file_id);
     }
 
-    pub fn set_native_diagnostics(&mut self, file_id: FileId, diagnostics: Vec<Diagnostic>) {
+    pub(crate) fn set_native_diagnostics(
+        &mut self,
+        file_id: FileId,
+        diagnostics: Vec<lsp_types::Diagnostic>,
+    ) {
         self.native.insert(file_id, diagnostics);
+        self.changes.insert(file_id);
     }
 
-    pub fn diagnostics_for(&self, file_id: FileId) -> impl Iterator<Item = &Diagnostic> {
+    pub(crate) fn diagnostics_for(
+        &self,
+        file_id: FileId,
+    ) -> impl Iterator<Item = &lsp_types::Diagnostic> {
         let native = self.native.get(&file_id).into_iter().flatten();
         let check = self.check.get(&file_id).into_iter().flatten();
         native.chain(check)
     }
 
-    pub fn handle_task(&mut self, task: DiagnosticTask) -> Vec<FileId> {
-        match task {
-            DiagnosticTask::ClearCheck => self.clear_check(),
-            DiagnosticTask::AddCheck(file_id, diagnostic, fixes) => {
-                self.add_check_diagnostic(file_id, diagnostic, fixes);
-                vec![file_id]
-            }
-            DiagnosticTask::SetNative(file_id, diagnostics) => {
-                self.set_native_diagnostics(file_id, diagnostics);
-                vec![file_id]
-            }
+    pub(crate) fn take_changes(&mut self) -> Option<FxHashSet<FileId>> {
+        if self.changes.is_empty() {
+            return None;
         }
+        Some(mem::take(&mut self.changes))
     }
 }
 
-fn are_diagnostics_equal(left: &Diagnostic, right: &Diagnostic) -> bool {
+fn are_diagnostics_equal(left: &lsp_types::Diagnostic, right: &lsp_types::Diagnostic) -> bool {
     left.source == right.source
         && left.severity == right.severity
         && left.range == right.range

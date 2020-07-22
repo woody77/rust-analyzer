@@ -1,15 +1,14 @@
 //! Builtin macro
-use crate::db::AstDatabase;
 use crate::{
-    ast::{self, AstToken, HasStringValue},
-    name, AstId, CrateId, MacroDefId, MacroDefKind, TextSize,
+    db::AstDatabase, name, quote, AstId, CrateId, EagerMacroId, LazyMacroId, MacroCallId,
+    MacroDefId, MacroDefKind, TextSize,
 };
 
-use crate::{quote, EagerMacroId, LazyMacroId, MacroCallId};
 use either::Either;
 use mbe::parse_to_token_tree;
-use ra_db::{FileId, RelativePath};
+use ra_db::FileId;
 use ra_parser::FragmentKind;
+use ra_syntax::ast::{self, AstToken, HasStringValue};
 
 macro_rules! register_builtin {
     ( LAZY: $(($name:ident, $kind: ident) => $expand:ident),* , EAGER: $(($e_name:ident, $e_kind: ident) => $e_expand:ident),*  ) => {
@@ -100,6 +99,8 @@ register_builtin! {
     EAGER:
     (concat, Concat) => concat_expand,
     (include, Include) => include_expand,
+    (include_bytes, IncludeBytes) => include_bytes_expand,
+    (include_str, IncludeStr) => include_str_expand,
     (env, Env) => env_expand,
     (option_env, OptionEnv) => option_env_expand
 }
@@ -271,7 +272,7 @@ fn format_args_expand(
 fn unquote_str(lit: &tt::Literal) -> Option<String> {
     let lit = ast::make::tokens::literal(&lit.to_string());
     let token = ast::String::cast(lit)?;
-    token.value()
+    token.value().map(|it| it.into_owned())
 }
 
 fn concat_expand(
@@ -293,21 +294,20 @@ fn concat_expand(
     Ok((quote!(#text), FragmentKind::Expr))
 }
 
-fn relative_file(db: &dyn AstDatabase, call_id: MacroCallId, path: &str) -> Option<FileId> {
+fn relative_file(
+    db: &dyn AstDatabase,
+    call_id: MacroCallId,
+    path: &str,
+    allow_recursion: bool,
+) -> Option<FileId> {
     let call_site = call_id.as_file().original_file(db);
-
-    // Handle trivial case
-    if let Some(res) = db.resolve_relative_path(call_site, &RelativePath::new(&path)) {
-        // Prevent include itself
-        return if res == call_site { None } else { Some(res) };
+    let res = db.resolve_path(call_site, path)?;
+    // Prevent include itself
+    if res == call_site && !allow_recursion {
+        None
+    } else {
+        Some(res)
     }
-
-    // Extern paths ?
-    let krate = *db.relevant_crates(call_site).get(0)?;
-    let (extern_source_id, relative_file) =
-        db.crate_graph()[krate].extern_source.extern_path(path)?;
-
-    db.resolve_extern_path(extern_source_id, &relative_file)
 }
 
 fn parse_string(tt: &tt::Subtree) -> Result<String, mbe::ExpandError> {
@@ -326,8 +326,8 @@ fn include_expand(
     tt: &tt::Subtree,
 ) -> Result<(tt::Subtree, FragmentKind), mbe::ExpandError> {
     let path = parse_string(tt)?;
-    let file_id =
-        relative_file(db, arg_id.into(), &path).ok_or_else(|| mbe::ExpandError::ConversionError)?;
+    let file_id = relative_file(db, arg_id.into(), &path, false)
+        .ok_or_else(|| mbe::ExpandError::ConversionError)?;
 
     // FIXME:
     // Handle include as expression
@@ -338,11 +338,50 @@ fn include_expand(
     Ok((res, FragmentKind::Items))
 }
 
-fn get_env_inner(db: &dyn AstDatabase, arg_id: EagerMacroId, key: &str) -> Option<String> {
-    let call_id: MacroCallId = arg_id.into();
-    let original_file = call_id.as_file().original_file(db);
+fn include_bytes_expand(
+    _db: &dyn AstDatabase,
+    _arg_id: EagerMacroId,
+    tt: &tt::Subtree,
+) -> Result<(tt::Subtree, FragmentKind), mbe::ExpandError> {
+    let _path = parse_string(tt)?;
 
-    let krate = *db.relevant_crates(original_file).get(0)?;
+    // FIXME: actually read the file here if the user asked for macro expansion
+    let res = tt::Subtree {
+        delimiter: None,
+        token_trees: vec![tt::TokenTree::Leaf(tt::Leaf::Literal(tt::Literal {
+            text: r#"b"""#.into(),
+            id: tt::TokenId::unspecified(),
+        }))],
+    };
+    Ok((res, FragmentKind::Expr))
+}
+
+fn include_str_expand(
+    db: &dyn AstDatabase,
+    arg_id: EagerMacroId,
+    tt: &tt::Subtree,
+) -> Result<(tt::Subtree, FragmentKind), mbe::ExpandError> {
+    let path = parse_string(tt)?;
+
+    // FIXME: we're not able to read excluded files (which is most of them because
+    // it's unusual to `include_str!` a Rust file), but we can return an empty string.
+    // Ideally, we'd be able to offer a precise expansion if the user asks for macro
+    // expansion.
+    let file_id = match relative_file(db, arg_id.into(), &path, true) {
+        Some(file_id) => file_id,
+        None => {
+            return Ok((quote!(""), FragmentKind::Expr));
+        }
+    };
+
+    let text = db.file_text(file_id);
+    let text = &*text;
+
+    Ok((quote!(#text), FragmentKind::Expr))
+}
+
+fn get_env_inner(db: &dyn AstDatabase, arg_id: EagerMacroId, key: &str) -> Option<String> {
+    let krate = db.lookup_intern_eager_expansion(arg_id).krate;
     db.crate_graph()[krate].env.get(key)
 }
 
@@ -401,6 +440,7 @@ mod tests {
 
         let expander = find_by_name(&macro_calls[0].name().unwrap().as_name()).unwrap();
 
+        let krate = CrateId(0);
         let file_id = match expander {
             Either::Left(expander) => {
                 // the first one should be a macro_rules
@@ -413,6 +453,7 @@ mod tests {
 
                 let loc = MacroCallLoc {
                     def,
+                    krate,
                     kind: MacroCallKind::FnLike(AstId::new(
                         file_id.into(),
                         ast_id_map.ast_id(&macro_calls[1]),
@@ -425,7 +466,7 @@ mod tests {
             Either::Right(expander) => {
                 // the first one should be a macro_rules
                 let def = MacroDefId {
-                    krate: Some(CrateId(0)),
+                    krate: Some(krate),
                     ast_id: Some(AstId::new(file_id.into(), ast_id_map.ast_id(&macro_calls[0]))),
                     kind: MacroDefKind::BuiltInEager(expander),
                     local_inner: false,
@@ -439,6 +480,7 @@ mod tests {
                         def,
                         fragment: FragmentKind::Expr,
                         subtree: Arc::new(parsed_args.clone()),
+                        krate,
                         file_id: file_id.into(),
                     }
                 });
@@ -448,6 +490,7 @@ mod tests {
                     def,
                     fragment,
                     subtree: Arc::new(subtree),
+                    krate,
                     file_id: file_id.into(),
                 };
 
@@ -586,5 +629,21 @@ mod tests {
             expanded,
             r#"std::fmt::Arguments::new_v1(&[], &[std::fmt::ArgumentV1::new(&(arg1(a,b,c)),std::fmt::Display::fmt),std::fmt::ArgumentV1::new(&(arg2),std::fmt::Display::fmt),])"#
         );
+    }
+
+    #[test]
+    fn test_include_bytes_expand() {
+        let expanded = expand_builtin_macro(
+            r#"
+            #[rustc_builtin_macro]
+            macro_rules! include_bytes {
+                ($file:expr) => {{ /* compiler built-in */ }};
+                ($file:expr,) => {{ /* compiler built-in */ }};
+            }
+            include_bytes("foo");
+            "#,
+        );
+
+        assert_eq!(expanded, r#"b"""#);
     }
 }

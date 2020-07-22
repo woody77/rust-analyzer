@@ -1,14 +1,13 @@
 //! Database used for testing `hir_def`.
 
 use std::{
-    panic,
+    fmt, panic,
     sync::{Arc, Mutex},
 };
 
 use hir_expand::db::AstDatabase;
-use ra_db::{
-    salsa, CrateId, ExternSourceId, FileId, FileLoader, FileLoaderDelegate, RelativePath, Upcast,
-};
+use ra_db::{salsa, CrateId, FileId, FileLoader, FileLoaderDelegate, Upcast};
+use rustc_hash::FxHashSet;
 
 use crate::db::DefDatabase;
 
@@ -19,10 +18,10 @@ use crate::db::DefDatabase;
     crate::db::InternDatabaseStorage,
     crate::db::DefDatabaseStorage
 )]
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct TestDB {
-    runtime: salsa::Runtime<TestDB>,
-    events: Mutex<Option<Vec<salsa::Event<TestDB>>>>,
+    storage: salsa::Storage<TestDB>,
+    events: Mutex<Option<Vec<salsa::Event>>>,
 }
 
 impl Upcast<dyn AstDatabase> for TestDB {
@@ -38,17 +37,17 @@ impl Upcast<dyn DefDatabase> for TestDB {
 }
 
 impl salsa::Database for TestDB {
-    fn salsa_runtime(&self) -> &salsa::Runtime<Self> {
-        &self.runtime
-    }
-    fn salsa_runtime_mut(&mut self) -> &mut salsa::Runtime<Self> {
-        &mut self.runtime
-    }
-    fn salsa_event(&self, event: impl Fn() -> salsa::Event<TestDB>) {
+    fn salsa_event(&self, event: salsa::Event) {
         let mut events = self.events.lock().unwrap();
         if let Some(events) = &mut *events {
-            events.push(event());
+            events.push(event);
         }
+    }
+}
+
+impl fmt::Debug for TestDB {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TestDB").finish()
     }
 }
 
@@ -58,23 +57,11 @@ impl FileLoader for TestDB {
     fn file_text(&self, file_id: FileId) -> Arc<String> {
         FileLoaderDelegate(self).file_text(file_id)
     }
-    fn resolve_relative_path(
-        &self,
-        anchor: FileId,
-        relative_path: &RelativePath,
-    ) -> Option<FileId> {
-        FileLoaderDelegate(self).resolve_relative_path(anchor, relative_path)
+    fn resolve_path(&self, anchor: FileId, path: &str) -> Option<FileId> {
+        FileLoaderDelegate(self).resolve_path(anchor, path)
     }
-    fn relevant_crates(&self, file_id: FileId) -> Arc<Vec<CrateId>> {
+    fn relevant_crates(&self, file_id: FileId) -> Arc<FxHashSet<CrateId>> {
         FileLoaderDelegate(self).relevant_crates(file_id)
-    }
-
-    fn resolve_extern_path(
-        &self,
-        extern_id: ExternSourceId,
-        relative_path: &RelativePath,
-    ) -> Option<FileId> {
-        FileLoaderDelegate(self).resolve_extern_path(extern_id, relative_path)
     }
 }
 
@@ -91,7 +78,7 @@ impl TestDB {
         panic!("Can't find module for file")
     }
 
-    pub fn log(&self, f: impl FnOnce()) -> Vec<salsa::Event<TestDB>> {
+    pub fn log(&self, f: impl FnOnce()) -> Vec<salsa::Event> {
         *self.events.lock().unwrap() = Some(Vec::new());
         f();
         self.events.lock().unwrap().take().unwrap()
@@ -105,7 +92,7 @@ impl TestDB {
                 // This pretty horrible, but `Debug` is the only way to inspect
                 // QueryDescriptor at the moment.
                 salsa::EventKind::WillExecute { database_key } => {
-                    Some(format!("{:?}", database_key))
+                    Some(format!("{:?}", database_key.debug(self)))
                 }
                 _ => None,
             })

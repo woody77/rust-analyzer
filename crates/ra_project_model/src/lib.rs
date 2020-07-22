@@ -1,41 +1,35 @@
 //! FIXME: write short doc here
 
 mod cargo_workspace;
-mod json_project;
+mod project_json;
 mod sysroot;
 
 use std::{
-    fs::{read_dir, File, ReadDir},
-    io::{self, BufReader},
-    path::{Path, PathBuf},
+    fs::{self, read_dir, ReadDir},
+    io,
+    path::Path,
     process::{Command, Output},
 };
 
 use anyhow::{bail, Context, Result};
+use paths::{AbsPath, AbsPathBuf};
 use ra_cfg::CfgOptions;
-use ra_db::{CrateGraph, CrateName, Edition, Env, ExternSource, ExternSourceId, FileId};
+use ra_db::{CrateGraph, CrateId, CrateName, Edition, Env, FileId};
 use rustc_hash::{FxHashMap, FxHashSet};
-use serde_json::from_reader;
 
 pub use crate::{
     cargo_workspace::{CargoConfig, CargoWorkspace, Package, Target, TargetKind},
-    json_project::JsonProject,
+    project_json::{ProjectJson, ProjectJsonData},
     sysroot::Sysroot,
 };
 pub use ra_proc_macro::ProcMacroClient;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum ProjectWorkspace {
     /// Project workspace was discovered by running `cargo metadata` and `rustc --print sysroot`.
     Cargo { cargo: CargoWorkspace, sysroot: Sysroot },
     /// Project workspace was manually specified using a `rust-project.json` file.
-    Json { project: JsonProject },
-}
-
-impl From<JsonProject> for ProjectWorkspace {
-    fn from(project: JsonProject) -> ProjectWorkspace {
-        ProjectWorkspace::Json { project }
-    }
+    Json { project: ProjectJson },
 }
 
 /// `PackageRoot` describes a package root folder.
@@ -44,19 +38,23 @@ impl From<JsonProject> for ProjectWorkspace {
 #[derive(Debug, Clone)]
 pub struct PackageRoot {
     /// Path to the root folder
-    path: PathBuf,
+    path: AbsPathBuf,
     /// Is a member of the current workspace
     is_member: bool,
+    out_dir: Option<AbsPathBuf>,
 }
 impl PackageRoot {
-    pub fn new_member(path: PathBuf) -> PackageRoot {
-        Self { path, is_member: true }
+    pub fn new_member(path: AbsPathBuf) -> PackageRoot {
+        Self { path, is_member: true, out_dir: None }
     }
-    pub fn new_non_member(path: PathBuf) -> PackageRoot {
-        Self { path, is_member: false }
+    pub fn new_non_member(path: AbsPathBuf) -> PackageRoot {
+        Self { path, is_member: false, out_dir: None }
     }
-    pub fn path(&self) -> &Path {
+    pub fn path(&self) -> &AbsPath {
         &self.path
+    }
+    pub fn out_dir(&self) -> Option<&AbsPath> {
+        self.out_dir.as_deref()
     }
     pub fn is_member(&self) -> bool {
         self.is_member
@@ -65,12 +63,12 @@ impl PackageRoot {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub enum ProjectManifest {
-    ProjectJson(PathBuf),
-    CargoToml(PathBuf),
+    ProjectJson(AbsPathBuf),
+    CargoToml(AbsPathBuf),
 }
 
 impl ProjectManifest {
-    pub fn from_manifest_file(path: PathBuf) -> Result<ProjectManifest> {
+    pub fn from_manifest_file(path: AbsPathBuf) -> Result<ProjectManifest> {
         if path.ends_with("rust-project.json") {
             return Ok(ProjectManifest::ProjectJson(path));
         }
@@ -80,7 +78,7 @@ impl ProjectManifest {
         bail!("project root must point to Cargo.toml or rust-project.json: {}", path.display())
     }
 
-    pub fn discover_single(path: &Path) -> Result<ProjectManifest> {
+    pub fn discover_single(path: &AbsPath) -> Result<ProjectManifest> {
         let mut candidates = ProjectManifest::discover(path)?;
         let res = match candidates.pop() {
             None => bail!("no projects"),
@@ -93,23 +91,23 @@ impl ProjectManifest {
         Ok(res)
     }
 
-    pub fn discover(path: &Path) -> io::Result<Vec<ProjectManifest>> {
+    pub fn discover(path: &AbsPath) -> io::Result<Vec<ProjectManifest>> {
         if let Some(project_json) = find_in_parent_dirs(path, "rust-project.json") {
             return Ok(vec![ProjectManifest::ProjectJson(project_json)]);
         }
         return find_cargo_toml(path)
             .map(|paths| paths.into_iter().map(ProjectManifest::CargoToml).collect());
 
-        fn find_cargo_toml(path: &Path) -> io::Result<Vec<PathBuf>> {
+        fn find_cargo_toml(path: &AbsPath) -> io::Result<Vec<AbsPathBuf>> {
             match find_in_parent_dirs(path, "Cargo.toml") {
                 Some(it) => Ok(vec![it]),
                 None => Ok(find_cargo_toml_in_child_dir(read_dir(path)?)),
             }
         }
 
-        fn find_in_parent_dirs(path: &Path, target_file_name: &str) -> Option<PathBuf> {
+        fn find_in_parent_dirs(path: &AbsPath, target_file_name: &str) -> Option<AbsPathBuf> {
             if path.ends_with(target_file_name) {
-                return Some(path.to_owned());
+                return Some(path.to_path_buf());
             }
 
             let mut curr = Some(path);
@@ -125,17 +123,18 @@ impl ProjectManifest {
             None
         }
 
-        fn find_cargo_toml_in_child_dir(entities: ReadDir) -> Vec<PathBuf> {
+        fn find_cargo_toml_in_child_dir(entities: ReadDir) -> Vec<AbsPathBuf> {
             // Only one level down to avoid cycles the easy way and stop a runaway scan with large projects
             entities
                 .filter_map(Result::ok)
                 .map(|it| it.path().join("Cargo.toml"))
                 .filter(|it| it.exists())
+                .map(AbsPathBuf::assert)
                 .collect()
         }
     }
 
-    pub fn discover_all(paths: &[impl AsRef<Path>]) -> Vec<ProjectManifest> {
+    pub fn discover_all(paths: &[impl AsRef<AbsPath>]) -> Vec<ProjectManifest> {
         let mut res = paths
             .iter()
             .filter_map(|it| ProjectManifest::discover(it.as_ref()).ok())
@@ -151,23 +150,23 @@ impl ProjectManifest {
 impl ProjectWorkspace {
     pub fn load(
         manifest: ProjectManifest,
-        cargo_features: &CargoConfig,
+        cargo_config: &CargoConfig,
         with_sysroot: bool,
     ) -> Result<ProjectWorkspace> {
         let res = match manifest {
             ProjectManifest::ProjectJson(project_json) => {
-                let file = File::open(&project_json).with_context(|| {
-                    format!("Failed to open json file {}", project_json.display())
+                let file = fs::read_to_string(&project_json).with_context(|| {
+                    format!("Failed to read json file {}", project_json.display())
                 })?;
-                let reader = BufReader::new(file);
-                ProjectWorkspace::Json {
-                    project: from_reader(reader).with_context(|| {
-                        format!("Failed to deserialize json file {}", project_json.display())
-                    })?,
-                }
+                let data = serde_json::from_str(&file).with_context(|| {
+                    format!("Failed to deserialize json file {}", project_json.display())
+                })?;
+                let project_location = project_json.parent().unwrap().to_path_buf();
+                let project = ProjectJson::new(&project_location, data);
+                ProjectWorkspace::Json { project }
             }
             ProjectManifest::CargoToml(cargo_toml) => {
-                let cargo = CargoWorkspace::from_cargo_metadata(&cargo_toml, cargo_features)
+                let cargo = CargoWorkspace::from_cargo_metadata(&cargo_toml, cargo_config)
                     .with_context(|| {
                         format!(
                             "Failed to read Cargo metadata from Cargo.toml file {}",
@@ -204,6 +203,7 @@ impl ProjectWorkspace {
                 .map(|pkg| PackageRoot {
                     path: cargo[pkg].root().to_path_buf(),
                     is_member: cargo[pkg].is_member,
+                    out_dir: cargo[pkg].out_dir.clone(),
                 })
                 .chain(sysroot.crates().map(|krate| {
                     PackageRoot::new_non_member(sysroot[krate].root_dir().to_path_buf())
@@ -212,18 +212,7 @@ impl ProjectWorkspace {
         }
     }
 
-    pub fn out_dirs(&self) -> Vec<PathBuf> {
-        match self {
-            ProjectWorkspace::Json { project } => {
-                project.crates.iter().filter_map(|krate| krate.out_dir.as_ref()).cloned().collect()
-            }
-            ProjectWorkspace::Cargo { cargo, sysroot: _ } => {
-                cargo.packages().filter_map(|pkg| cargo[pkg].out_dir.as_ref()).cloned().collect()
-            }
-        }
-    }
-
-    pub fn proc_macro_dylib_paths(&self) -> Vec<PathBuf> {
+    pub fn proc_macro_dylib_paths(&self) -> Vec<AbsPathBuf> {
         match self {
             ProjectWorkspace::Json { project } => project
                 .crates
@@ -241,7 +230,7 @@ impl ProjectWorkspace {
 
     pub fn n_packages(&self) -> usize {
         match self {
-            ProjectWorkspace::Json { project } => project.crates.len(),
+            ProjectWorkspace::Json { project, .. } => project.crates.len(),
             ProjectWorkspace::Cargo { cargo, sysroot } => {
                 cargo.packages().len() + sysroot.crates().len()
             }
@@ -250,71 +239,51 @@ impl ProjectWorkspace {
 
     pub fn to_crate_graph(
         &self,
-        default_cfg_options: &CfgOptions,
-        extern_source_roots: &FxHashMap<PathBuf, ExternSourceId>,
+        target: Option<&str>,
         proc_macro_client: &ProcMacroClient,
-        load: &mut dyn FnMut(&Path) -> Option<FileId>,
+        load: &mut dyn FnMut(&AbsPath) -> Option<FileId>,
     ) -> CrateGraph {
         let mut crate_graph = CrateGraph::default();
         match self {
             ProjectWorkspace::Json { project } => {
+                let mut target_cfg_map = FxHashMap::<Option<&str>, CfgOptions>::default();
                 let crates: FxHashMap<_, _> = project
                     .crates
                     .iter()
                     .enumerate()
                     .filter_map(|(seq_index, krate)| {
-                        let file_id = load(&krate.root_module)?;
-                        let edition = match krate.edition {
-                            json_project::Edition::Edition2015 => Edition::Edition2015,
-                            json_project::Edition::Edition2018 => Edition::Edition2018,
-                        };
-                        let cfg_options = {
-                            let mut opts = default_cfg_options.clone();
-                            for cfg in &krate.cfg {
-                                match cfg.find('=') {
-                                    None => opts.insert_atom(cfg.into()),
-                                    Some(pos) => {
-                                        let key = &cfg[..pos];
-                                        let value = cfg[pos + 1..].trim_matches('"');
-                                        opts.insert_key_value(key.into(), value.into());
-                                    }
-                                }
-                            }
-                            for name in &krate.atom_cfgs {
-                                opts.insert_atom(name.into());
-                            }
-                            for (key, value) in &krate.key_value_cfgs {
-                                opts.insert_key_value(key.into(), value.into());
-                            }
-                            opts
-                        };
+                        let file_path = &krate.root_module;
+                        let file_id = load(&file_path)?;
 
                         let mut env = Env::default();
-                        let mut extern_source = ExternSource::default();
                         if let Some(out_dir) = &krate.out_dir {
                             // NOTE: cargo and rustc seem to hide non-UTF-8 strings from env! and option_env!()
                             if let Some(out_dir) = out_dir.to_str().map(|s| s.to_owned()) {
                                 env.set("OUT_DIR", out_dir);
-                            }
-                            if let Some(&extern_source_id) = extern_source_roots.get(out_dir) {
-                                extern_source.set_extern_path(&out_dir, extern_source_id);
                             }
                         }
                         let proc_macro = krate
                             .proc_macro_dylib_path
                             .clone()
                             .map(|it| proc_macro_client.by_dylib_path(&it));
+
+                        let target = krate.target.as_deref().or(target);
+                        let target_cfgs = target_cfg_map
+                            .entry(target.clone())
+                            .or_insert_with(|| get_rustc_cfg_options(target.as_deref()));
+                        let mut cfg_options = krate.cfg.clone();
+                        cfg_options.append(target_cfgs);
+
                         // FIXME: No crate name in json definition such that we cannot add OUT_DIR to env
                         Some((
-                            json_project::CrateId(seq_index),
+                            CrateId(seq_index as u32),
                             crate_graph.add_crate_root(
                                 file_id,
-                                edition,
+                                krate.edition,
                                 // FIXME json definitions can store the crate name
                                 None,
                                 cfg_options,
                                 env,
-                                extern_source,
                                 proc_macro.unwrap_or_default(),
                             ),
                         ))
@@ -323,15 +292,12 @@ impl ProjectWorkspace {
 
                 for (id, krate) in project.crates.iter().enumerate() {
                     for dep in &krate.deps {
-                        let from_crate_id = json_project::CrateId(id);
-                        let to_crate_id = dep.krate;
+                        let from_crate_id = CrateId(id as u32);
+                        let to_crate_id = dep.crate_id;
                         if let (Some(&from), Some(&to)) =
                             (crates.get(&from_crate_id), crates.get(&to_crate_id))
                         {
-                            if crate_graph
-                                .add_dep(from, CrateName::new(&dep.name).unwrap(), to)
-                                .is_err()
-                            {
+                            if crate_graph.add_dep(from, dep.name.clone(), to).is_err() {
                                 log::error!(
                                     "cyclic dependency {:?} -> {:?}",
                                     from_crate_id,
@@ -343,31 +309,22 @@ impl ProjectWorkspace {
                 }
             }
             ProjectWorkspace::Cargo { cargo, sysroot } => {
+                let mut cfg_options = get_rustc_cfg_options(target);
+
                 let sysroot_crates: FxHashMap<_, _> = sysroot
                     .crates()
                     .filter_map(|krate| {
                         let file_id = load(&sysroot[krate].root)?;
 
-                        // Crates from sysroot have `cfg(test)` disabled
-                        let cfg_options = {
-                            let mut opts = default_cfg_options.clone();
-                            opts.remove_atom("test");
-                            opts
-                        };
-
                         let env = Env::default();
-                        let extern_source = ExternSource::default();
                         let proc_macro = vec![];
-                        let crate_name = CrateName::new(&sysroot[krate].name)
-                            .expect("Sysroot crate names should not contain dashes");
-
+                        let name = sysroot[krate].name.clone();
                         let crate_id = crate_graph.add_crate_root(
                             file_id,
                             Edition::Edition2018,
-                            Some(crate_name),
-                            cfg_options,
+                            Some(name),
+                            cfg_options.clone(),
                             env,
-                            extern_source,
                             proc_macro,
                         );
                         Some((krate, crate_id))
@@ -396,6 +353,10 @@ impl ProjectWorkspace {
 
                 let mut pkg_to_lib_crate = FxHashMap::default();
                 let mut pkg_crates = FxHashMap::default();
+
+                // Add test cfg for non-sysroot crates
+                cfg_options.insert_atom("test".into());
+
                 // Next, create crates for each package, target pair
                 for pkg in cargo.packages() {
                     let mut lib_tgt = None;
@@ -404,7 +365,7 @@ impl ProjectWorkspace {
                         if let Some(file_id) = load(root) {
                             let edition = cargo[pkg].edition;
                             let cfg_options = {
-                                let mut opts = default_cfg_options.clone();
+                                let mut opts = cfg_options.clone();
                                 for feature in cargo[pkg].features.iter() {
                                     opts.insert_key_value("feature".into(), feature.into());
                                 }
@@ -420,14 +381,10 @@ impl ProjectWorkspace {
                                 opts
                             };
                             let mut env = Env::default();
-                            let mut extern_source = ExternSource::default();
                             if let Some(out_dir) = &cargo[pkg].out_dir {
                                 // NOTE: cargo and rustc seem to hide non-UTF-8 strings from env! and option_env!()
                                 if let Some(out_dir) = out_dir.to_str().map(|s| s.to_owned()) {
                                     env.set("OUT_DIR", out_dir);
-                                }
-                                if let Some(&extern_source_id) = extern_source_roots.get(out_dir) {
-                                    extern_source.set_extern_path(&out_dir, extern_source_id);
                                 }
                             }
                             let proc_macro = cargo[pkg]
@@ -439,10 +396,9 @@ impl ProjectWorkspace {
                             let crate_id = crate_graph.add_crate_root(
                                 file_id,
                                 edition,
-                                Some(CrateName::normalize_dashes(&cargo[pkg].name)),
+                                Some(cargo[pkg].name.clone()),
                                 cfg_options,
                                 env,
-                                extern_source,
                                 proc_macro.clone(),
                             );
                             if cargo[tgt].kind == TargetKind::Lib {
@@ -548,20 +504,20 @@ impl ProjectWorkspace {
         crate_graph
     }
 
-    pub fn workspace_root_for(&self, path: &Path) -> Option<&Path> {
+    pub fn workspace_root_for(&self, path: &Path) -> Option<&AbsPath> {
         match self {
             ProjectWorkspace::Cargo { cargo, .. } => {
                 Some(cargo.workspace_root()).filter(|root| path.starts_with(root))
             }
-            ProjectWorkspace::Json { project: JsonProject { roots, .. } } => roots
+            ProjectWorkspace::Json { project: ProjectJson { roots, .. }, .. } => roots
                 .iter()
                 .find(|root| path.starts_with(&root.path))
-                .map(|root| root.path.as_ref()),
+                .map(|root| root.path.as_path()),
         }
     }
 }
 
-pub fn get_rustc_cfg_options(target: Option<&String>) -> CfgOptions {
+fn get_rustc_cfg_options(target: Option<&str>) -> CfgOptions {
     let mut cfg_options = CfgOptions::default();
 
     // Some nightly-only cfgs, which are required for stdlib
@@ -579,7 +535,7 @@ pub fn get_rustc_cfg_options(target: Option<&String>) -> CfgOptions {
         let mut cmd = Command::new(ra_toolchain::rustc());
         cmd.args(&["--print", "cfg", "-O"]);
         if let Some(target) = target {
-            cmd.args(&["--target", target.as_str()]);
+            cmd.args(&["--target", target]);
         }
         let output = output(cmd)?;
         Ok(String::from_utf8(output.stdout)?)
@@ -600,6 +556,8 @@ pub fn get_rustc_cfg_options(target: Option<&String>) -> CfgOptions {
         }
         Err(e) => log::error!("failed to get rustc cfgs: {:#}", e),
     }
+
+    cfg_options.insert_atom("debug_assertions".into());
 
     cfg_options
 }

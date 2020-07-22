@@ -4,6 +4,7 @@ name = "xtask"
 version = "0.1.0"
 authors = ["rust-analyzer developers"]
 publish = false
+license = "MIT OR Apache-2.0"
 
 [lib]
 doctest = false
@@ -14,3 +15,4 @@ pico-args = "0.3.1"
 quote = "1.0.2"
 proc-macro2 = "1.0.8"
 anyhow = "1.0.26"
+flate2 = "1.0"

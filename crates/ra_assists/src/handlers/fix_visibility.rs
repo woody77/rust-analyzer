@@ -1,12 +1,8 @@
 use hir::{db::HirDatabase, HasSource, HasVisibility, PathResolution};
 use ra_db::FileId;
-use ra_syntax::{
-    ast, AstNode,
-    SyntaxKind::{ATTR, COMMENT, WHITESPACE},
-    SyntaxNode, TextRange, TextSize,
-};
+use ra_syntax::{ast, AstNode, TextRange, TextSize};
 
-use crate::{AssistContext, AssistId, Assists};
+use crate::{utils::vis_offset, AssistContext, AssistId, AssistKind, Assists};
 
 // FIXME: this really should be a fix for diagnostic, rather than an assist.
 
@@ -45,14 +41,14 @@ fn add_vis_to_referenced_module_def(acc: &mut Assists, ctx: &AssistContext) -> O
     };
 
     let current_module = ctx.sema.scope(&path.syntax()).module()?;
-    let target_module = def.module(ctx.db)?;
+    let target_module = def.module(ctx.db())?;
 
-    let vis = target_module.visibility_of(ctx.db, &def)?;
-    if vis.is_visible_from(ctx.db, current_module.into()) {
+    let vis = target_module.visibility_of(ctx.db(), &def)?;
+    if vis.is_visible_from(ctx.db(), current_module.into()) {
         return None;
     };
 
-    let (offset, target, target_file, target_name) = target_data_for_def(ctx.db, def)?;
+    let (offset, target, target_file, target_name) = target_data_for_def(ctx.db(), def)?;
 
     let missing_visibility =
         if current_module.krate() == target_module.krate() { "pub(crate)" } else { "pub" };
@@ -62,8 +58,8 @@ fn add_vis_to_referenced_module_def(acc: &mut Assists, ctx: &AssistContext) -> O
         Some(name) => format!("Change visibility of {} to {}", name, missing_visibility),
     };
 
-    acc.add(AssistId("fix_visibility"), assist_label, target, |builder| {
-        builder.set_file(target_file);
+    acc.add(AssistId("fix_visibility", AssistKind::QuickFix), assist_label, target, |builder| {
+        builder.edit_file(target_file);
         match ctx.config.snippet_cap {
             Some(cap) => builder.insert_snippet(cap, offset, format!("$0{} ", missing_visibility)),
             None => builder.insert(offset, format!("{} ", missing_visibility)),
@@ -76,16 +72,16 @@ fn add_vis_to_referenced_record_field(acc: &mut Assists, ctx: &AssistContext) ->
     let (record_field_def, _) = ctx.sema.resolve_record_field(&record_field)?;
 
     let current_module = ctx.sema.scope(record_field.syntax()).module()?;
-    let visibility = record_field_def.visibility(ctx.db);
-    if visibility.is_visible_from(ctx.db, current_module.into()) {
+    let visibility = record_field_def.visibility(ctx.db());
+    if visibility.is_visible_from(ctx.db(), current_module.into()) {
         return None;
     }
 
-    let parent = record_field_def.parent_def(ctx.db);
-    let parent_name = parent.name(ctx.db);
-    let target_module = parent.module(ctx.db);
+    let parent = record_field_def.parent_def(ctx.db());
+    let parent_name = parent.name(ctx.db());
+    let target_module = parent.module(ctx.db());
 
-    let in_file_source = record_field_def.source(ctx.db);
+    let in_file_source = record_field_def.source(ctx.db());
     let (offset, target) = match in_file_source.value {
         hir::FieldSource::Named(it) => {
             let s = it.syntax();
@@ -99,14 +95,14 @@ fn add_vis_to_referenced_record_field(acc: &mut Assists, ctx: &AssistContext) ->
 
     let missing_visibility =
         if current_module.krate() == target_module.krate() { "pub(crate)" } else { "pub" };
-    let target_file = in_file_source.file_id.original_file(ctx.db);
+    let target_file = in_file_source.file_id.original_file(ctx.db());
 
-    let target_name = record_field_def.name(ctx.db);
+    let target_name = record_field_def.name(ctx.db());
     let assist_label =
         format!("Change visibility of {}.{} to {}", parent_name, target_name, missing_visibility);
 
-    acc.add(AssistId("fix_visibility"), assist_label, target, |builder| {
-        builder.set_file(target_file);
+    acc.add(AssistId("fix_visibility", AssistKind::QuickFix), assist_label, target, |builder| {
+        builder.edit_file(target_file);
         match ctx.config.snippet_cap {
             Some(cap) => builder.insert_snippet(cap, offset, format!("$0{} ", missing_visibility)),
             None => builder.insert(offset, format!("{} ", missing_visibility)),
@@ -177,17 +173,6 @@ fn target_data_for_def(
     Some((offset, target, target_file, target_name))
 }
 
-fn vis_offset(node: &SyntaxNode) -> TextSize {
-    node.children_with_tokens()
-        .skip_while(|it| match it.kind() {
-            WHITESPACE | COMMENT | ATTR => true,
-            _ => false,
-        })
-        .next()
-        .map(|it| it.text_range().start())
-        .unwrap_or_else(|| node.text_range().start())
-}
-
 #[cfg(test)]
 mod tests {
     use crate::tests::{check_assist, check_assist_not_applicable};
@@ -255,15 +240,14 @@ mod tests {
         check_assist(
             fix_visibility,
             r"
-              //- /main.rs
-              mod foo;
-              fn main() { foo::Foo<|> }
+//- /main.rs
+mod foo;
+fn main() { foo::Foo<|> }
 
-              //- /foo.rs
-              struct Foo;
-              ",
+//- /foo.rs
+struct Foo;
+",
             r"$0pub(crate) struct Foo;
-
 ",
         );
     }
@@ -279,14 +263,14 @@ mod tests {
         );
         check_assist(
             fix_visibility,
-            r"//- /lib.rs
-              mod foo;
-              fn main() { foo::Foo { <|>bar: () }; }
-              //- /foo.rs
-              pub struct Foo { bar: () }
-              ",
+            r"
+//- /lib.rs
+mod foo;
+fn main() { foo::Foo { <|>bar: () }; }
+//- /foo.rs
+pub struct Foo { bar: () }
+",
             r"pub struct Foo { $0pub(crate) bar: () }
-
 ",
         );
         check_assist_not_applicable(
@@ -296,12 +280,13 @@ mod tests {
         );
         check_assist_not_applicable(
             fix_visibility,
-            r"//- /lib.rs
-              mod foo;
-              fn main() { foo::Foo { <|>bar: () }; }
-              //- /foo.rs
-              pub struct Foo { pub bar: () }
-              ",
+            r"
+//- /lib.rs
+mod foo;
+fn main() { foo::Foo { <|>bar: () }; }
+//- /foo.rs
+pub struct Foo { pub bar: () }
+",
         );
     }
 
@@ -316,14 +301,14 @@ mod tests {
         );
         check_assist(
             fix_visibility,
-            r"//- /lib.rs
-              mod foo;
-              fn main() { foo::Foo::Bar { <|>bar: () }; }
-              //- /foo.rs
-              pub enum Foo { Bar { bar: () } }
-              ",
+            r"
+//- /lib.rs
+mod foo;
+fn main() { foo::Foo::Bar { <|>bar: () }; }
+//- /foo.rs
+pub enum Foo { Bar { bar: () } }
+",
             r"pub enum Foo { Bar { $0pub(crate) bar: () } }
-
 ",
         );
         check_assist_not_applicable(
@@ -333,12 +318,13 @@ mod tests {
         );
         check_assist_not_applicable(
             fix_visibility,
-            r"//- /lib.rs
-              mod foo;
-              fn main() { foo::Foo { <|>bar: () }; }
-              //- /foo.rs
-              pub struct Foo { pub bar: () }
-              ",
+            r"
+//- /lib.rs
+mod foo;
+fn main() { foo::Foo { <|>bar: () }; }
+//- /foo.rs
+pub struct Foo { pub bar: () }
+",
         );
     }
 
@@ -355,14 +341,14 @@ mod tests {
         );
         check_assist(
             fix_visibility,
-            r"//- /lib.rs
-              mod foo;
-              fn main() { foo::Foo { <|>bar: () }; }
-              //- /foo.rs
-              pub union Foo { bar: () }
-              ",
+            r"
+//- /lib.rs
+mod foo;
+fn main() { foo::Foo { <|>bar: () }; }
+//- /foo.rs
+pub union Foo { bar: () }
+",
             r"pub union Foo { $0pub(crate) bar: () }
-
 ",
         );
         check_assist_not_applicable(
@@ -372,12 +358,13 @@ mod tests {
         );
         check_assist_not_applicable(
             fix_visibility,
-            r"//- /lib.rs
-              mod foo;
-              fn main() { foo::Foo { <|>bar: () }; }
-              //- /foo.rs
-              pub union Foo { pub bar: () }
-              ",
+            r"
+//- /lib.rs
+mod foo;
+fn main() { foo::Foo { <|>bar: () }; }
+//- /foo.rs
+pub union Foo { pub bar: () }
+",
         );
     }
 
@@ -458,19 +445,18 @@ mod tests {
         check_assist(
             fix_visibility,
             r"
-            //- /main.rs
-            mod foo;
-            fn main() { foo::bar<|>::baz(); }
+//- /main.rs
+mod foo;
+fn main() { foo::bar<|>::baz(); }
 
-            //- /foo.rs
-            mod bar {
-                pub fn baz() {}
-            }
-            ",
+//- /foo.rs
+mod bar {
+    pub fn baz() {}
+}
+",
             r"$0pub(crate) mod bar {
     pub fn baz() {}
 }
-
 ",
         );
 
@@ -486,17 +472,15 @@ mod tests {
         check_assist(
             fix_visibility,
             r"
-            //- /main.rs
-            mod foo;
-            fn main() { foo::bar<|>::baz(); }
+//- /main.rs
+mod foo;
+fn main() { foo::bar<|>::baz(); }
 
-            //- /foo.rs
-            mod bar;
-
-            //- /foo/bar.rs
-            pub fn baz() {}
-            }
-            ",
+//- /foo.rs
+mod bar;
+//- /foo/bar.rs
+pub fn baz() {}
+",
             r"$0pub(crate) mod bar;
 ",
         );
@@ -506,14 +490,16 @@ mod tests {
     fn fix_visibility_of_module_declaration_in_other_file() {
         check_assist(
             fix_visibility,
-            r"//- /main.rs
-              mod foo;
-              fn main() { foo::bar<|>>::baz(); }
+            r"
+//- /main.rs
+mod foo;
+fn main() { foo::bar<|>>::baz(); }
 
-              //- /foo.rs
-              mod bar {
-                  pub fn baz() {}
-              }",
+//- /foo.rs
+mod bar {
+    pub fn baz() {}
+}
+",
             r"$0pub(crate) mod bar {
     pub fn baz() {}
 }
@@ -525,10 +511,12 @@ mod tests {
     fn adds_pub_when_target_is_in_another_crate() {
         check_assist(
             fix_visibility,
-            r"//- /main.rs crate:a deps:foo
-              foo::Bar<|>
-              //- /lib.rs crate:foo
-              struct Bar;",
+            r"
+//- /main.rs crate:a deps:foo
+foo::Bar<|>
+//- /lib.rs crate:foo
+struct Bar;
+",
             r"$0pub struct Bar;
 ",
         )

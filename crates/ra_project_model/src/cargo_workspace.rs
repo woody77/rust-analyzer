@@ -9,6 +9,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use cargo_metadata::{BuildScript, CargoOpt, Message, MetadataCommand, PackageId};
+use paths::{AbsPath, AbsPathBuf};
 use ra_arena::{Arena, Idx};
 use ra_db::Edition;
 use rustc_hash::FxHashMap;
@@ -20,11 +21,14 @@ use rustc_hash::FxHashMap;
 /// `CrateGraph`. `CrateGraph` is lower-level: it knows only about the crates,
 /// while this knows about `Packages` & `Targets`: purely cargo-related
 /// concepts.
-#[derive(Debug, Clone)]
+///
+/// We use absolute paths here, `cargo metadata` guarantees to always produce
+/// abs paths.
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct CargoWorkspace {
     packages: Arena<PackageData>,
     targets: Arena<TargetData>,
-    workspace_root: PathBuf,
+    workspace_root: AbsPathBuf,
 }
 
 impl ops::Index<Package> for CargoWorkspace {
@@ -41,7 +45,7 @@ impl ops::Index<Target> for CargoWorkspace {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub struct CargoConfig {
     /// Do not activate the `default` feature.
     pub no_default_features: bool,
@@ -60,48 +64,36 @@ pub struct CargoConfig {
     pub target: Option<String>,
 }
 
-impl Default for CargoConfig {
-    fn default() -> Self {
-        CargoConfig {
-            no_default_features: false,
-            all_features: false,
-            features: Vec::new(),
-            load_out_dirs_from_check: false,
-            target: None,
-        }
-    }
-}
-
 pub type Package = Idx<PackageData>;
 
 pub type Target = Idx<TargetData>;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct PackageData {
     pub version: String,
     pub name: String,
-    pub manifest: PathBuf,
+    pub manifest: AbsPathBuf,
     pub targets: Vec<Target>,
     pub is_member: bool,
     pub dependencies: Vec<PackageDependency>,
     pub edition: Edition,
     pub features: Vec<String>,
     pub cfgs: Vec<String>,
-    pub out_dir: Option<PathBuf>,
-    pub proc_macro_dylib_path: Option<PathBuf>,
+    pub out_dir: Option<AbsPathBuf>,
+    pub proc_macro_dylib_path: Option<AbsPathBuf>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct PackageDependency {
     pub pkg: Package,
     pub name: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct TargetData {
     pub package: Package,
     pub name: String,
-    pub root: PathBuf,
+    pub root: AbsPathBuf,
     pub kind: TargetKind,
     pub is_proc_macro: bool,
 }
@@ -135,19 +127,19 @@ impl TargetKind {
 }
 
 impl PackageData {
-    pub fn root(&self) -> &Path {
+    pub fn root(&self) -> &AbsPath {
         self.manifest.parent().unwrap()
     }
 }
 
 impl CargoWorkspace {
     pub fn from_cargo_metadata(
-        cargo_toml: &Path,
+        cargo_toml: &AbsPath,
         cargo_features: &CargoConfig,
     ) -> Result<CargoWorkspace> {
         let mut meta = MetadataCommand::new();
         meta.cargo_path(ra_toolchain::cargo());
-        meta.manifest_path(cargo_toml);
+        meta.manifest_path(cargo_toml.to_path_buf());
         if cargo_features.all_features {
             meta.features(CargoOpt::AllFeatures);
         } else if cargo_features.no_default_features {
@@ -158,12 +150,12 @@ impl CargoWorkspace {
             meta.features(CargoOpt::SomeFeatures(cargo_features.features.clone()));
         }
         if let Some(parent) = cargo_toml.parent() {
-            meta.current_dir(parent);
+            meta.current_dir(parent.to_path_buf());
         }
         if let Some(target) = cargo_features.target.as_ref() {
             meta.other_options(vec![String::from("--filter-platform"), target.clone()]);
         }
-        let meta = meta.exec().with_context(|| {
+        let mut meta = meta.exec().with_context(|| {
             format!("Failed to run `cargo metadata --manifest-path {}`", cargo_toml.display())
         })?;
 
@@ -183,6 +175,7 @@ impl CargoWorkspace {
 
         let ws_members = &meta.workspace_members;
 
+        meta.packages.sort_by(|a, b| a.id.cmp(&b.id));
         for meta_pkg in meta.packages {
             let cargo_metadata::Package { id, edition, name, manifest_path, version, .. } =
                 meta_pkg;
@@ -193,7 +186,7 @@ impl CargoWorkspace {
             let pkg = packages.alloc(PackageData {
                 name,
                 version: version.to_string(),
-                manifest: manifest_path,
+                manifest: AbsPathBuf::assert(manifest_path),
                 targets: Vec::new(),
                 is_member,
                 edition,
@@ -210,7 +203,7 @@ impl CargoWorkspace {
                 let tgt = targets.alloc(TargetData {
                     package: pkg,
                     name: meta_tgt.name,
-                    root: meta_tgt.src_path.clone(),
+                    root: AbsPathBuf::assert(meta_tgt.src_path.clone()),
                     kind: TargetKind::new(meta_tgt.kind.as_slice()),
                     is_proc_macro,
                 });
@@ -218,7 +211,7 @@ impl CargoWorkspace {
             }
         }
         let resolve = meta.resolve.expect("metadata executed with deps");
-        for node in resolve.nodes {
+        for mut node in resolve.nodes {
             let source = match pkg_by_id.get(&node.id) {
                 Some(&src) => src,
                 // FIXME: replace this and a similar branch below with `.unwrap`, once
@@ -229,6 +222,7 @@ impl CargoWorkspace {
                     continue;
                 }
             };
+            node.deps.sort_by(|a, b| a.pkg.cmp(&b.pkg));
             for dep_node in node.deps {
                 let pkg = match pkg_by_id.get(&dep_node.pkg) {
                     Some(&pkg) => pkg,
@@ -246,21 +240,22 @@ impl CargoWorkspace {
             packages[source].features.extend(node.features);
         }
 
-        Ok(CargoWorkspace { packages, targets, workspace_root: meta.workspace_root })
+        let workspace_root = AbsPathBuf::assert(meta.workspace_root);
+        Ok(CargoWorkspace { packages, targets, workspace_root: workspace_root })
     }
 
     pub fn packages<'a>(&'a self) -> impl Iterator<Item = Package> + ExactSizeIterator + 'a {
         self.packages.iter().map(|(id, _pkg)| id)
     }
 
-    pub fn target_by_root(&self, root: &Path) -> Option<Target> {
+    pub fn target_by_root(&self, root: &AbsPath) -> Option<Target> {
         self.packages()
-            .filter_map(|pkg| self[pkg].targets.iter().find(|&&it| self[it].root == root))
+            .filter_map(|pkg| self[pkg].targets.iter().find(|&&it| &self[it].root == root))
             .next()
             .copied()
     }
 
-    pub fn workspace_root(&self) -> &Path {
+    pub fn workspace_root(&self) -> &AbsPath {
         &self.workspace_root
     }
 
@@ -279,8 +274,8 @@ impl CargoWorkspace {
 
 #[derive(Debug, Clone, Default)]
 pub struct ExternResources {
-    out_dirs: FxHashMap<PackageId, PathBuf>,
-    proc_dylib_paths: FxHashMap<PackageId, PathBuf>,
+    out_dirs: FxHashMap<PackageId, AbsPathBuf>,
+    proc_dylib_paths: FxHashMap<PackageId, AbsPathBuf>,
     cfgs: FxHashMap<PackageId, Vec<String>>,
 }
 
@@ -308,8 +303,13 @@ pub fn load_extern_resources(
         if let Ok(message) = message {
             match message {
                 Message::BuildScriptExecuted(BuildScript { package_id, out_dir, cfgs, .. }) => {
-                    res.out_dirs.insert(package_id.clone(), out_dir);
-                    res.cfgs.insert(package_id, cfgs);
+                    // cargo_metadata crate returns default (empty) path for
+                    // older cargos, which is not absolute, so work around that.
+                    if out_dir != PathBuf::default() {
+                        let out_dir = AbsPathBuf::assert(out_dir);
+                        res.out_dirs.insert(package_id.clone(), out_dir);
+                        res.cfgs.insert(package_id, cfgs);
+                    }
                 }
                 Message::CompilerArtifact(message) => {
                     if message.target.kind.contains(&"proc-macro".to_string()) {
@@ -317,7 +317,8 @@ pub fn load_extern_resources(
                         // Skip rmeta file
                         if let Some(filename) = message.filenames.iter().find(|name| is_dylib(name))
                         {
-                            res.proc_dylib_paths.insert(package_id, filename.clone());
+                            let filename = AbsPathBuf::assert(filename.clone());
+                            res.proc_dylib_paths.insert(package_id, filename);
                         }
                     }
                 }

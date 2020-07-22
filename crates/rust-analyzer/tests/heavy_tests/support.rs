@@ -9,21 +9,19 @@ use std::{
 use crossbeam_channel::{after, select, Receiver};
 use lsp_server::{Connection, Message, Notification, Request};
 use lsp_types::{
-    notification::{DidOpenTextDocument, Exit},
-    request::Shutdown,
-    DidOpenTextDocumentParams, TextDocumentIdentifier, TextDocumentItem, Url, WorkDoneProgress,
+    notification::Exit, request::Shutdown, TextDocumentIdentifier, Url, WorkDoneProgress,
 };
 use lsp_types::{ProgressParams, ProgressParamsValue};
+use ra_project_model::ProjectManifest;
+use rust_analyzer::{
+    config::{ClientCapsConfig, Config, FilesConfig, FilesWatcher, LinkedProject},
+    main_loop,
+};
 use serde::Serialize;
 use serde_json::{to_string_pretty, Value};
 use tempfile::TempDir;
-use test_utils::{find_mismatch, parse_fixture};
-
-use ra_project_model::ProjectManifest;
-use rust_analyzer::{
-    config::{ClientCapsConfig, Config, LinkedProject},
-    main_loop,
-};
+use test_utils::{find_mismatch, Fixture};
+use vfs::AbsPathBuf;
 
 pub struct Project<'a> {
     fixture: &'a str,
@@ -66,19 +64,17 @@ impl<'a> Project<'a> {
             ra_prof::init_from(crate::PROFILE);
         });
 
-        let mut paths = vec![];
-
-        for entry in parse_fixture(self.fixture) {
-            let path = tmp_dir.path().join(entry.meta.path().as_str());
+        for entry in Fixture::parse(self.fixture) {
+            let path = tmp_dir.path().join(&entry.path['/'.len_utf8()..]);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(path.as_path(), entry.text.as_bytes()).unwrap();
-            paths.push((path, entry.text));
         }
 
+        let tmp_dir_path = AbsPathBuf::assert(tmp_dir.path().to_path_buf());
         let mut roots =
-            self.roots.into_iter().map(|root| tmp_dir.path().join(root)).collect::<Vec<_>>();
+            self.roots.into_iter().map(|root| tmp_dir_path.join(root)).collect::<Vec<_>>();
         if roots.is_empty() {
-            roots.push(tmp_dir.path().to_path_buf());
+            roots.push(tmp_dir_path.clone());
         }
         let linked_projects = roots
             .into_iter()
@@ -95,14 +91,14 @@ impl<'a> Project<'a> {
             },
             with_sysroot: self.with_sysroot,
             linked_projects,
-            ..Config::default()
+            files: FilesConfig { watcher: FilesWatcher::Client, exclude: Vec::new() },
+            ..Config::new(tmp_dir_path)
         };
-
         if let Some(f) = &self.config {
             f(&mut config)
         }
 
-        Server::new(tmp_dir, config, paths)
+        Server::new(tmp_dir, config)
     }
 }
 
@@ -120,7 +116,7 @@ pub struct Server {
 }
 
 impl Server {
-    fn new(dir: TempDir, config: Config, files: Vec<(PathBuf, String)>) -> Server {
+    fn new(dir: TempDir, config: Config) -> Server {
         let (connection, client) = Connection::memory();
 
         let _thread = jod_thread::Builder::new()
@@ -128,20 +124,7 @@ impl Server {
             .spawn(move || main_loop(config, connection).unwrap())
             .expect("failed to spawn a thread");
 
-        let res =
-            Server { req_id: Cell::new(1), dir, messages: Default::default(), client, _thread };
-
-        for (path, text) in files {
-            res.notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
-                text_document: TextDocumentItem {
-                    uri: Url::from_file_path(path).unwrap(),
-                    language_id: "rust".to_string(),
-                    version: 0,
-                    text,
-                },
-            })
-        }
-        res
+        Server { req_id: Cell::new(1), dir, messages: Default::default(), client, _thread }
     }
 
     pub fn doc_id(&self, rel_path: &str) -> TextDocumentIdentifier {
@@ -191,8 +174,21 @@ impl Server {
         self.client.sender.send(r.into()).unwrap();
         while let Some(msg) = self.recv() {
             match msg {
-                Message::Request(req) if req.method == "window/workDoneProgress/create" => (),
-                Message::Request(req) => panic!("unexpected request: {:?}", req),
+                Message::Request(req) => {
+                    if req.method == "window/workDoneProgress/create" {
+                        continue;
+                    }
+                    if req.method == "client/registerCapability" {
+                        let params = req.params.to_string();
+                        if ["workspace/didChangeWatchedFiles", "textDocument/didSave"]
+                            .iter()
+                            .any(|&it| params.contains(it))
+                        {
+                            continue;
+                        }
+                    }
+                    panic!("unexpected request: {:?}", req)
+                }
                 Message::Notification(_) => (),
                 Message::Response(res) => {
                     assert_eq!(res.id, id);
@@ -212,7 +208,7 @@ impl Server {
                     ProgressParams {
                         token: lsp_types::ProgressToken::String(ref token),
                         value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(_)),
-                    } if token == "rustAnalyzer/startup" => true,
+                    } if token == "rustAnalyzer/roots scanned" => true,
                     _ => false,
                 }
             }

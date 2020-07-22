@@ -2,12 +2,14 @@
 //! For details about how this works in rustc, see the method lookup page in the
 //! [rustc guide](https://rust-lang.github.io/rustc-guide/method-lookup.html)
 //! and the corresponding code mostly in librustc_typeck/check/method/probe.rs.
-use std::sync::Arc;
+use std::{iter, sync::Arc};
 
 use arrayvec::ArrayVec;
 use hir_def::{
-    lang_item::LangItemTarget, type_ref::Mutability, AssocContainerId, AssocItemId, FunctionId,
-    HasModule, ImplId, Lookup, TraitId,
+    builtin_type::{IntBitness, Signedness},
+    lang_item::LangItemTarget,
+    type_ref::Mutability,
+    AssocContainerId, AssocItemId, FunctionId, HasModule, ImplId, Lookup, TraitId,
 };
 use hir_expand::name::Name;
 use ra_db::CrateId;
@@ -18,9 +20,9 @@ use super::Substs;
 use crate::{
     autoderef,
     db::HirDatabase,
-    primitive::{FloatBitness, Uncertain},
+    primitive::{FloatBitness, FloatTy, IntTy},
     utils::all_super_traits,
-    ApplicationTy, Canonical, DebruijnIndex, InEnvironment, TraitEnvironment, TraitRef, Ty,
+    ApplicationTy, Canonical, DebruijnIndex, InEnvironment, TraitEnvironment, TraitRef, Ty, TyKind,
     TypeCtor, TypeWalk,
 };
 
@@ -42,83 +44,187 @@ impl TyFingerprint {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub struct CrateImplDefs {
-    impls: FxHashMap<TyFingerprint, Vec<ImplId>>,
-    impls_by_trait: FxHashMap<TraitId, FxHashMap<Option<TyFingerprint>, Vec<ImplId>>>,
+pub(crate) const ALL_INT_FPS: [TyFingerprint; 12] = [
+    TyFingerprint::Apply(TypeCtor::Int(IntTy {
+        signedness: Signedness::Unsigned,
+        bitness: IntBitness::X8,
+    })),
+    TyFingerprint::Apply(TypeCtor::Int(IntTy {
+        signedness: Signedness::Unsigned,
+        bitness: IntBitness::X16,
+    })),
+    TyFingerprint::Apply(TypeCtor::Int(IntTy {
+        signedness: Signedness::Unsigned,
+        bitness: IntBitness::X32,
+    })),
+    TyFingerprint::Apply(TypeCtor::Int(IntTy {
+        signedness: Signedness::Unsigned,
+        bitness: IntBitness::X64,
+    })),
+    TyFingerprint::Apply(TypeCtor::Int(IntTy {
+        signedness: Signedness::Unsigned,
+        bitness: IntBitness::X128,
+    })),
+    TyFingerprint::Apply(TypeCtor::Int(IntTy {
+        signedness: Signedness::Unsigned,
+        bitness: IntBitness::Xsize,
+    })),
+    TyFingerprint::Apply(TypeCtor::Int(IntTy {
+        signedness: Signedness::Signed,
+        bitness: IntBitness::X8,
+    })),
+    TyFingerprint::Apply(TypeCtor::Int(IntTy {
+        signedness: Signedness::Signed,
+        bitness: IntBitness::X16,
+    })),
+    TyFingerprint::Apply(TypeCtor::Int(IntTy {
+        signedness: Signedness::Signed,
+        bitness: IntBitness::X32,
+    })),
+    TyFingerprint::Apply(TypeCtor::Int(IntTy {
+        signedness: Signedness::Signed,
+        bitness: IntBitness::X64,
+    })),
+    TyFingerprint::Apply(TypeCtor::Int(IntTy {
+        signedness: Signedness::Signed,
+        bitness: IntBitness::X128,
+    })),
+    TyFingerprint::Apply(TypeCtor::Int(IntTy {
+        signedness: Signedness::Signed,
+        bitness: IntBitness::Xsize,
+    })),
+];
+
+pub(crate) const ALL_FLOAT_FPS: [TyFingerprint; 2] = [
+    TyFingerprint::Apply(TypeCtor::Float(FloatTy { bitness: FloatBitness::X32 })),
+    TyFingerprint::Apply(TypeCtor::Float(FloatTy { bitness: FloatBitness::X64 })),
+];
+
+/// Trait impls defined or available in some crate.
+#[derive(Debug, Eq, PartialEq)]
+pub struct TraitImpls {
+    // If the `Option<TyFingerprint>` is `None`, the impl may apply to any self type.
+    map: FxHashMap<TraitId, FxHashMap<Option<TyFingerprint>, Vec<ImplId>>>,
 }
 
-impl CrateImplDefs {
-    pub(crate) fn impls_in_crate_query(db: &dyn HirDatabase, krate: CrateId) -> Arc<CrateImplDefs> {
-        let _p = profile("impls_in_crate_query");
-        let mut res =
-            CrateImplDefs { impls: FxHashMap::default(), impls_by_trait: FxHashMap::default() };
+impl TraitImpls {
+    pub(crate) fn trait_impls_in_crate_query(db: &dyn HirDatabase, krate: CrateId) -> Arc<Self> {
+        let _p = profile("trait_impls_in_crate_query");
+        let mut impls = Self { map: FxHashMap::default() };
 
         let crate_def_map = db.crate_def_map(krate);
         for (_module_id, module_data) in crate_def_map.modules.iter() {
             for impl_id in module_data.scope.impls() {
-                match db.impl_trait(impl_id) {
-                    Some(tr) => {
-                        let self_ty = db.impl_self_ty(impl_id);
-                        let self_ty_fp = TyFingerprint::for_impl(&self_ty.value);
-                        res.impls_by_trait
-                            .entry(tr.value.trait_)
-                            .or_default()
-                            .entry(self_ty_fp)
-                            .or_default()
-                            .push(impl_id);
-                    }
-                    None => {
-                        let self_ty = db.impl_self_ty(impl_id);
-                        if let Some(self_ty_fp) = TyFingerprint::for_impl(&self_ty.value) {
-                            res.impls.entry(self_ty_fp).or_default().push(impl_id);
-                        }
-                    }
-                }
+                let target_trait = match db.impl_trait(impl_id) {
+                    Some(tr) => tr.value.trait_,
+                    None => continue,
+                };
+                let self_ty = db.impl_self_ty(impl_id);
+                let self_ty_fp = TyFingerprint::for_impl(&self_ty.value);
+                impls
+                    .map
+                    .entry(target_trait)
+                    .or_default()
+                    .entry(self_ty_fp)
+                    .or_default()
+                    .push(impl_id);
             }
+        }
+
+        Arc::new(impls)
+    }
+
+    pub(crate) fn trait_impls_in_deps_query(db: &dyn HirDatabase, krate: CrateId) -> Arc<Self> {
+        let _p = profile("trait_impls_in_deps_query");
+        let crate_graph = db.crate_graph();
+        let mut res = Self { map: FxHashMap::default() };
+
+        for krate in crate_graph.transitive_deps(krate) {
+            res.merge(&db.trait_impls_in_crate(krate));
         }
 
         Arc::new(res)
     }
-    pub fn lookup_impl_defs(&self, ty: &Ty) -> impl Iterator<Item = ImplId> + '_ {
-        let fingerprint = TyFingerprint::for_impl(ty);
-        fingerprint.and_then(|f| self.impls.get(&f)).into_iter().flatten().copied()
+
+    fn merge(&mut self, other: &Self) {
+        for (trait_, other_map) in &other.map {
+            let map = self.map.entry(*trait_).or_default();
+            for (fp, impls) in other_map {
+                let vec = map.entry(*fp).or_default();
+                vec.extend(impls);
+            }
+        }
     }
 
-    pub fn lookup_impl_defs_for_trait(&self, tr: TraitId) -> impl Iterator<Item = ImplId> + '_ {
-        self.impls_by_trait
-            .get(&tr)
+    /// Queries all impls of the given trait.
+    pub fn for_trait(&self, trait_: TraitId) -> impl Iterator<Item = ImplId> + '_ {
+        self.map
+            .get(&trait_)
             .into_iter()
-            .flat_map(|m| m.values().flat_map(|v| v.iter().copied()))
+            .flat_map(|map| map.values().flat_map(|v| v.iter().copied()))
     }
 
-    pub fn lookup_impl_defs_for_trait_and_ty(
+    /// Queries all impls of `trait_` that may apply to `self_ty`.
+    pub fn for_trait_and_self_ty(
         &self,
-        tr: TraitId,
-        fp: TyFingerprint,
+        trait_: TraitId,
+        self_ty: TyFingerprint,
     ) -> impl Iterator<Item = ImplId> + '_ {
-        self.impls_by_trait
-            .get(&tr)
-            .and_then(|m| m.get(&Some(fp)))
+        self.map
+            .get(&trait_)
             .into_iter()
-            .flatten()
-            .copied()
-            .chain(
-                self.impls_by_trait
-                    .get(&tr)
-                    .and_then(|m| m.get(&None))
-                    .into_iter()
-                    .flatten()
-                    .copied(),
-            )
+            .flat_map(move |map| map.get(&None).into_iter().chain(map.get(&Some(self_ty))))
+            .flat_map(|v| v.iter().copied())
     }
 
-    pub fn all_impls<'a>(&'a self) -> impl Iterator<Item = ImplId> + 'a {
-        self.impls
-            .values()
-            .chain(self.impls_by_trait.values().flat_map(|m| m.values()))
-            .flatten()
-            .copied()
+    pub fn all_impls(&self) -> impl Iterator<Item = ImplId> + '_ {
+        self.map.values().flat_map(|map| map.values().flat_map(|v| v.iter().copied()))
+    }
+}
+
+/// Inherent impls defined in some crate.
+///
+/// Inherent impls can only be defined in the crate that also defines the self type of the impl
+/// (note that some primitives are considered to be defined by both libcore and liballoc).
+///
+/// This makes inherent impl lookup easier than trait impl lookup since we only have to consider a
+/// single crate.
+#[derive(Debug, Eq, PartialEq)]
+pub struct InherentImpls {
+    map: FxHashMap<TyFingerprint, Vec<ImplId>>,
+}
+
+impl InherentImpls {
+    pub(crate) fn inherent_impls_in_crate_query(db: &dyn HirDatabase, krate: CrateId) -> Arc<Self> {
+        let mut map: FxHashMap<_, Vec<_>> = FxHashMap::default();
+
+        let crate_def_map = db.crate_def_map(krate);
+        for (_module_id, module_data) in crate_def_map.modules.iter() {
+            for impl_id in module_data.scope.impls() {
+                let data = db.impl_data(impl_id);
+                if data.target_trait.is_some() {
+                    continue;
+                }
+
+                let self_ty = db.impl_self_ty(impl_id);
+                if let Some(fp) = TyFingerprint::for_impl(&self_ty.value) {
+                    map.entry(fp).or_default().push(impl_id);
+                }
+            }
+        }
+
+        Arc::new(Self { map })
+    }
+
+    pub fn for_self_ty(&self, self_ty: &Ty) -> &[ImplId] {
+        match TyFingerprint::for_impl(self_ty) {
+            Some(fp) => self.map.get(&fp).map(|vec| vec.as_ref()).unwrap_or(&[]),
+            None => &[],
+        }
+    }
+
+    pub fn all_impls(&self) -> impl Iterator<Item = ImplId> + '_ {
+        self.map.values().flat_map(|v| v.iter().copied())
     }
 }
 
@@ -147,12 +253,12 @@ impl Ty {
                 }
                 TypeCtor::Bool => lang_item_crate!("bool"),
                 TypeCtor::Char => lang_item_crate!("char"),
-                TypeCtor::Float(Uncertain::Known(f)) => match f.bitness {
+                TypeCtor::Float(f) => match f.bitness {
                     // There are two lang items: one in libcore (fXX) and one in libstd (fXX_runtime)
                     FloatBitness::X32 => lang_item_crate!("f32", "f32_runtime"),
                     FloatBitness::X64 => lang_item_crate!("f64", "f64_runtime"),
                 },
-                TypeCtor::Int(Uncertain::Known(i)) => lang_item_crate!(i.ty_to_string()),
+                TypeCtor::Int(i) => lang_item_crate!(i.ty_to_string()),
                 TypeCtor::Str => lang_item_crate!("str_alloc", "str"),
                 TypeCtor::Slice => lang_item_crate!("slice_alloc", "slice"),
                 TypeCtor::RawPtr(Mutability::Shared) => lang_item_crate!("const_ptr"),
@@ -222,6 +328,34 @@ pub fn iterate_method_candidates<T>(
     mode: LookupMode,
     mut callback: impl FnMut(&Ty, AssocItemId) -> Option<T>,
 ) -> Option<T> {
+    let mut slot = None;
+    iterate_method_candidates_impl(
+        ty,
+        db,
+        env,
+        krate,
+        traits_in_scope,
+        name,
+        mode,
+        &mut |ty, item| {
+            assert!(slot.is_none());
+            slot = callback(ty, item);
+            slot.is_some()
+        },
+    );
+    slot
+}
+
+fn iterate_method_candidates_impl(
+    ty: &Canonical<Ty>,
+    db: &dyn HirDatabase,
+    env: Arc<TraitEnvironment>,
+    krate: CrateId,
+    traits_in_scope: &FxHashSet<TraitId>,
+    name: Option<&Name>,
+    mode: LookupMode,
+    callback: &mut dyn FnMut(&Ty, AssocItemId) -> bool,
+) -> bool {
     match mode {
         LookupMode::MethodCall => {
             // For method calls, rust first does any number of autoderef, and then one
@@ -249,19 +383,19 @@ pub fn iterate_method_candidates<T>(
 
             let deref_chain = autoderef_method_receiver(db, krate, ty);
             for i in 0..deref_chain.len() {
-                if let Some(result) = iterate_method_candidates_with_autoref(
+                if iterate_method_candidates_with_autoref(
                     &deref_chain[i..],
                     db,
                     env.clone(),
                     krate,
                     traits_in_scope,
                     name,
-                    &mut callback,
+                    callback,
                 ) {
-                    return Some(result);
+                    return true;
                 }
             }
-            None
+            false
         }
         LookupMode::Path => {
             // No autoderef for path lookups
@@ -272,22 +406,22 @@ pub fn iterate_method_candidates<T>(
                 krate,
                 traits_in_scope,
                 name,
-                &mut callback,
+                callback,
             )
         }
     }
 }
 
-fn iterate_method_candidates_with_autoref<T>(
+fn iterate_method_candidates_with_autoref(
     deref_chain: &[Canonical<Ty>],
     db: &dyn HirDatabase,
     env: Arc<TraitEnvironment>,
     krate: CrateId,
     traits_in_scope: &FxHashSet<TraitId>,
     name: Option<&Name>,
-    mut callback: impl FnMut(&Ty, AssocItemId) -> Option<T>,
-) -> Option<T> {
-    if let Some(result) = iterate_method_candidates_by_receiver(
+    mut callback: &mut dyn FnMut(&Ty, AssocItemId) -> bool,
+) -> bool {
+    if iterate_method_candidates_by_receiver(
         &deref_chain[0],
         &deref_chain[1..],
         db,
@@ -297,13 +431,13 @@ fn iterate_method_candidates_with_autoref<T>(
         name,
         &mut callback,
     ) {
-        return Some(result);
+        return true;
     }
     let refed = Canonical {
-        num_vars: deref_chain[0].num_vars,
+        kinds: deref_chain[0].kinds.clone(),
         value: Ty::apply_one(TypeCtor::Ref(Mutability::Shared), deref_chain[0].value.clone()),
     };
-    if let Some(result) = iterate_method_candidates_by_receiver(
+    if iterate_method_candidates_by_receiver(
         &refed,
         deref_chain,
         db,
@@ -313,13 +447,13 @@ fn iterate_method_candidates_with_autoref<T>(
         name,
         &mut callback,
     ) {
-        return Some(result);
+        return true;
     }
     let ref_muted = Canonical {
-        num_vars: deref_chain[0].num_vars,
+        kinds: deref_chain[0].kinds.clone(),
         value: Ty::apply_one(TypeCtor::Ref(Mutability::Mut), deref_chain[0].value.clone()),
     };
-    if let Some(result) = iterate_method_candidates_by_receiver(
+    if iterate_method_candidates_by_receiver(
         &ref_muted,
         deref_chain,
         db,
@@ -329,12 +463,12 @@ fn iterate_method_candidates_with_autoref<T>(
         name,
         &mut callback,
     ) {
-        return Some(result);
+        return true;
     }
-    None
+    false
 }
 
-fn iterate_method_candidates_by_receiver<T>(
+fn iterate_method_candidates_by_receiver(
     receiver_ty: &Canonical<Ty>,
     rest_of_deref_chain: &[Canonical<Ty>],
     db: &dyn HirDatabase,
@@ -342,20 +476,18 @@ fn iterate_method_candidates_by_receiver<T>(
     krate: CrateId,
     traits_in_scope: &FxHashSet<TraitId>,
     name: Option<&Name>,
-    mut callback: impl FnMut(&Ty, AssocItemId) -> Option<T>,
-) -> Option<T> {
+    mut callback: &mut dyn FnMut(&Ty, AssocItemId) -> bool,
+) -> bool {
     // We're looking for methods with *receiver* type receiver_ty. These could
     // be found in any of the derefs of receiver_ty, so we have to go through
     // that.
     for self_ty in std::iter::once(receiver_ty).chain(rest_of_deref_chain) {
-        if let Some(result) =
-            iterate_inherent_methods(self_ty, db, name, Some(receiver_ty), krate, &mut callback)
-        {
-            return Some(result);
+        if iterate_inherent_methods(self_ty, db, name, Some(receiver_ty), krate, &mut callback) {
+            return true;
         }
     }
     for self_ty in std::iter::once(receiver_ty).chain(rest_of_deref_chain) {
-        if let Some(result) = iterate_trait_method_candidates(
+        if iterate_trait_method_candidates(
             self_ty,
             db,
             env.clone(),
@@ -365,40 +497,28 @@ fn iterate_method_candidates_by_receiver<T>(
             Some(receiver_ty),
             &mut callback,
         ) {
-            return Some(result);
+            return true;
         }
     }
-    None
+    false
 }
 
-fn iterate_method_candidates_for_self_ty<T>(
+fn iterate_method_candidates_for_self_ty(
     self_ty: &Canonical<Ty>,
     db: &dyn HirDatabase,
     env: Arc<TraitEnvironment>,
     krate: CrateId,
     traits_in_scope: &FxHashSet<TraitId>,
     name: Option<&Name>,
-    mut callback: impl FnMut(&Ty, AssocItemId) -> Option<T>,
-) -> Option<T> {
-    if let Some(result) = iterate_inherent_methods(self_ty, db, name, None, krate, &mut callback) {
-        return Some(result);
+    mut callback: &mut dyn FnMut(&Ty, AssocItemId) -> bool,
+) -> bool {
+    if iterate_inherent_methods(self_ty, db, name, None, krate, &mut callback) {
+        return true;
     }
-    if let Some(result) = iterate_trait_method_candidates(
-        self_ty,
-        db,
-        env,
-        krate,
-        traits_in_scope,
-        name,
-        None,
-        &mut callback,
-    ) {
-        return Some(result);
-    }
-    None
+    iterate_trait_method_candidates(self_ty, db, env, krate, traits_in_scope, name, None, callback)
 }
 
-fn iterate_trait_method_candidates<T>(
+fn iterate_trait_method_candidates(
     self_ty: &Canonical<Ty>,
     db: &dyn HirDatabase,
     env: Arc<TraitEnvironment>,
@@ -406,8 +526,8 @@ fn iterate_trait_method_candidates<T>(
     traits_in_scope: &FxHashSet<TraitId>,
     name: Option<&Name>,
     receiver_ty: Option<&Canonical<Ty>>,
-    mut callback: impl FnMut(&Ty, AssocItemId) -> Option<T>,
-) -> Option<T> {
+    callback: &mut dyn FnMut(&Ty, AssocItemId) -> bool,
+) -> bool {
     // if ty is `dyn Trait`, the trait doesn't need to be in scope
     let inherent_trait =
         self_ty.value.dyn_trait().into_iter().flat_map(|t| all_super_traits(db.upcast(), t));
@@ -440,26 +560,30 @@ fn iterate_trait_method_candidates<T>(
                 }
             }
             known_implemented = true;
-            if let Some(result) = callback(&self_ty.value, *item) {
-                return Some(result);
+            if callback(&self_ty.value, *item) {
+                return true;
             }
         }
     }
-    None
+    false
 }
 
-fn iterate_inherent_methods<T>(
+fn iterate_inherent_methods(
     self_ty: &Canonical<Ty>,
     db: &dyn HirDatabase,
     name: Option<&Name>,
     receiver_ty: Option<&Canonical<Ty>>,
     krate: CrateId,
-    mut callback: impl FnMut(&Ty, AssocItemId) -> Option<T>,
-) -> Option<T> {
-    for krate in self_ty.value.def_crates(db, krate)? {
-        let impls = db.impls_in_crate(krate);
+    callback: &mut dyn FnMut(&Ty, AssocItemId) -> bool,
+) -> bool {
+    let def_crates = match self_ty.value.def_crates(db, krate) {
+        Some(k) => k,
+        None => return false,
+    };
+    for krate in def_crates {
+        let impls = db.inherent_impls_in_crate(krate);
 
-        for impl_def in impls.lookup_impl_defs(&self_ty.value) {
+        for &impl_def in impls.for_self_ty(&self_ty.value) {
             for &item in db.impl_data(impl_def).items.iter() {
                 if !is_valid_candidate(db, name, receiver_ty, item, self_ty) {
                     continue;
@@ -472,13 +596,13 @@ fn iterate_inherent_methods<T>(
                     test_utils::mark::hit!(impl_self_type_match_without_receiver);
                     continue;
                 }
-                if let Some(result) = callback(&self_ty.value, item) {
-                    return Some(result);
+                if callback(&self_ty.value, item) {
+                    return true;
                 }
             }
         }
     }
-    None
+    false
 }
 
 /// Returns the self type for the index trait call.
@@ -545,18 +669,19 @@ pub(crate) fn inherent_impl_substs(
     // we create a var for each type parameter of the impl; we need to keep in
     // mind here that `self_ty` might have vars of its own
     let vars = Substs::build_for_def(db, impl_id)
-        .fill_with_bound_vars(DebruijnIndex::INNERMOST, self_ty.num_vars)
+        .fill_with_bound_vars(DebruijnIndex::INNERMOST, self_ty.kinds.len())
         .build();
     let self_ty_with_vars = db.impl_self_ty(impl_id).subst(&vars);
-    let self_ty_with_vars =
-        Canonical { num_vars: vars.len() + self_ty.num_vars, value: self_ty_with_vars };
-    let substs = super::infer::unify(&self_ty_with_vars, self_ty);
+    let mut kinds = self_ty.kinds.to_vec();
+    kinds.extend(iter::repeat(TyKind::General).take(vars.len()));
+    let tys = Canonical { kinds: kinds.into(), value: (self_ty_with_vars, self_ty.value.clone()) };
+    let substs = super::infer::unify(&tys);
     // We only want the substs for the vars we added, not the ones from self_ty.
     // Also, if any of the vars we added are still in there, we replace them by
     // Unknown. I think this can only really happen if self_ty contained
     // Unknown, and in that case we want the result to contain Unknown in those
     // places again.
-    substs.map(|s| fallback_bound_vars(s.suffix(vars.len()), self_ty.num_vars))
+    substs.map(|s| fallback_bound_vars(s.suffix(vars.len()), self_ty.kinds.len()))
 }
 
 /// This replaces any 'free' Bound vars in `s` (i.e. those with indices past
@@ -616,15 +741,15 @@ fn generic_implements_goal(
     trait_: TraitId,
     self_ty: Canonical<Ty>,
 ) -> Canonical<InEnvironment<super::Obligation>> {
-    let num_vars = self_ty.num_vars;
+    let mut kinds = self_ty.kinds.to_vec();
     let substs = super::Substs::build_for_def(db, trait_)
         .push(self_ty.value)
-        .fill_with_bound_vars(DebruijnIndex::INNERMOST, num_vars)
+        .fill_with_bound_vars(DebruijnIndex::INNERMOST, kinds.len())
         .build();
-    let num_vars = substs.len() - 1 + self_ty.num_vars;
+    kinds.extend(iter::repeat(TyKind::General).take(substs.len() - 1));
     let trait_ref = TraitRef { trait_, substs };
     let obligation = super::Obligation::Trait(trait_ref);
-    Canonical { num_vars, value: InEnvironment::new(env, obligation) }
+    Canonical { kinds: kinds.into(), value: InEnvironment::new(env, obligation) }
 }
 
 fn autoderef_method_receiver(
@@ -637,9 +762,9 @@ fn autoderef_method_receiver(
     if let Some(Ty::Apply(ApplicationTy { ctor: TypeCtor::Array, parameters })) =
         deref_chain.last().map(|ty| &ty.value)
     {
-        let num_vars = deref_chain.last().unwrap().num_vars;
+        let kinds = deref_chain.last().unwrap().kinds.clone();
         let unsized_ty = Ty::apply(TypeCtor::Slice, parameters.clone());
-        deref_chain.push(Canonical { value: unsized_ty, num_vars })
+        deref_chain.push(Canonical { value: unsized_ty, kinds })
     }
     deref_chain
 }

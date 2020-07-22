@@ -3,7 +3,7 @@
 use super::*;
 
 pub(super) const PATH_FIRST: TokenSet =
-    token_set![IDENT, SELF_KW, SUPER_KW, CRATE_KW, COLON, L_ANGLE];
+    token_set![IDENT, T![self], T![super], T![crate], T![:], T![<]];
 
 pub(super) fn is_path_start(p: &Parser) -> bool {
     is_use_path_start(p) || p.at(T![<])
@@ -41,10 +41,7 @@ fn path(p: &mut Parser, mode: Mode) {
     path_segment(p, mode, true);
     let mut qual = path.complete(p, PATH);
     loop {
-        let use_tree = match p.nth(2) {
-            T![*] | T!['{'] => true,
-            _ => false,
-        };
+        let use_tree = matches!(p.nth(2), T![*] | T!['{']);
         if p.at(T![::]) && !use_tree {
             let path = qual.precede(p);
             p.bump(T![::]);
@@ -73,8 +70,10 @@ fn path_segment(p: &mut Parser, mode: Mode, first: bool) {
         }
         p.expect(T![>]);
     } else {
+        let mut empty = true;
         if first {
             p.eat(T![::]);
+            empty = false;
         }
         match p.current() {
             IDENT => {
@@ -86,6 +85,12 @@ fn path_segment(p: &mut Parser, mode: Mode, first: bool) {
             T![self] | T![super] | T![crate] => p.bump_any(),
             _ => {
                 p.err_recover("expected identifier", items::ITEM_RECOVERY_SET);
+                if empty {
+                    // test_err empty_segment
+                    // use crate::;
+                    m.abandon(p);
+                    return;
+                }
             }
         };
     }

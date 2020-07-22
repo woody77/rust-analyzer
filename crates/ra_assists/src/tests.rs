@@ -1,27 +1,21 @@
 mod generated;
 
-use std::sync::Arc;
-
 use hir::Semantics;
 use ra_db::{fixture::WithFixture, FileId, FileRange, SourceDatabaseExt};
-use ra_ide_db::{symbol_index::SymbolsDatabase, RootDatabase};
+use ra_ide_db::RootDatabase;
 use ra_syntax::TextRange;
-use test_utils::{
-    assert_eq_text, extract_offset, extract_range, extract_range_or_offset, RangeOrOffset,
-};
+use test_utils::{assert_eq_text, extract_offset, extract_range};
 
-use crate::{handlers::Handler, Assist, AssistConfig, AssistContext, Assists};
+use crate::{handlers::Handler, Assist, AssistConfig, AssistContext, AssistKind, Assists};
+use stdx::trim_indent;
 
 pub(crate) fn with_single_file(text: &str) -> (RootDatabase, FileId) {
-    let (mut db, file_id) = RootDatabase::with_single_file(text);
-    // FIXME: ideally, this should be done by the above `RootDatabase::with_single_file`,
-    // but it looks like this might need specialization? :(
-    db.set_local_roots(Arc::new(vec![db.file_source_root(file_id)]));
-    (db, file_id)
+    RootDatabase::with_single_file(text)
 }
 
 pub(crate) fn check_assist(assist: Handler, ra_fixture_before: &str, ra_fixture_after: &str) {
-    check(assist, ra_fixture_before, ExpectedResult::After(ra_fixture_after));
+    let ra_fixture_after = trim_indent(ra_fixture_after);
+    check(assist, ra_fixture_before, ExpectedResult::After(&ra_fixture_after));
 }
 
 // FIXME: instead of having a separate function here, maybe use
@@ -36,8 +30,9 @@ pub(crate) fn check_assist_not_applicable(assist: Handler, ra_fixture: &str) {
 }
 
 fn check_doc_test(assist_id: &str, before: &str, after: &str) {
-    let (selection, before) = extract_range_or_offset(before);
-    let (db, file_id) = crate::tests::with_single_file(&before);
+    let after = trim_indent(after);
+    let (db, file_id, selection) = RootDatabase::with_range_or_offset(&before);
+    let before = db.file_text(file_id).to_string();
     let frange = FileRange { file_id, range: selection.into() };
 
     let mut assist = Assist::resolved(&db, &AssistConfig::default(), frange)
@@ -57,11 +52,11 @@ fn check_doc_test(assist_id: &str, before: &str, after: &str) {
 
     let actual = {
         let change = assist.source_change.source_file_edits.pop().unwrap();
-        let mut actual = before.clone();
+        let mut actual = before;
         change.edit.apply(&mut actual);
         actual
     };
-    assert_eq_text!(after, &actual);
+    assert_eq_text!(&after, &actual);
 }
 
 enum ExpectedResult<'a> {
@@ -71,20 +66,8 @@ enum ExpectedResult<'a> {
 }
 
 fn check(handler: Handler, before: &str, expected: ExpectedResult) {
-    let (text_without_caret, file_with_caret_id, range_or_offset, db) = if before.contains("//-") {
-        let (mut db, position) = RootDatabase::with_position(before);
-        db.set_local_roots(Arc::new(vec![db.file_source_root(position.file_id)]));
-        (
-            db.file_text(position.file_id).as_ref().to_owned(),
-            position.file_id,
-            RangeOrOffset::Offset(position.offset),
-            db,
-        )
-    } else {
-        let (range_or_offset, text_without_caret) = extract_range_or_offset(before);
-        let (db, file_id) = with_single_file(&text_without_caret);
-        (text_without_caret, file_id, range_or_offset, db)
-    };
+    let (db, file_with_caret_id, range_or_offset) = RootDatabase::with_range_or_offset(before);
+    let text_without_caret = db.file_text(file_with_caret_id).to_string();
 
     let frange = FileRange { file_id: file_with_caret_id, range: range_or_offset.into() };
 
@@ -150,4 +133,47 @@ fn assist_order_if_expr() {
 
     assert_eq!(assists.next().expect("expected assist").assist.label, "Extract into variable");
     assert_eq!(assists.next().expect("expected assist").assist.label, "Replace with match");
+}
+
+#[test]
+fn assist_filter_works() {
+    let before = "
+    pub fn test_some_range(a: int) -> bool {
+        if let 2..6 = <|>5<|> {
+            true
+        } else {
+            false
+        }
+    }";
+    let (range, before) = extract_range(before);
+    let (db, file_id) = with_single_file(&before);
+    let frange = FileRange { file_id, range };
+
+    {
+        let mut cfg = AssistConfig::default();
+        cfg.allowed = Some(vec![AssistKind::Refactor]);
+
+        let assists = Assist::resolved(&db, &cfg, frange);
+        let mut assists = assists.iter();
+
+        assert_eq!(assists.next().expect("expected assist").assist.label, "Extract into variable");
+        assert_eq!(assists.next().expect("expected assist").assist.label, "Replace with match");
+    }
+
+    {
+        let mut cfg = AssistConfig::default();
+        cfg.allowed = Some(vec![AssistKind::RefactorExtract]);
+        let assists = Assist::resolved(&db, &cfg, frange);
+        assert_eq!(assists.len(), 1);
+
+        let mut assists = assists.iter();
+        assert_eq!(assists.next().expect("expected assist").assist.label, "Extract into variable");
+    }
+
+    {
+        let mut cfg = AssistConfig::default();
+        cfg.allowed = Some(vec![AssistKind::QuickFix]);
+        let assists = Assist::resolved(&db, &cfg, frange);
+        assert!(assists.is_empty(), "All asserts but quickfixes should be filtered out");
+    }
 }

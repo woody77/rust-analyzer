@@ -22,26 +22,6 @@ impl Debug for S {
 }
 
 #[test]
-fn doctest_add_derive() {
-    check_doc_test(
-        "add_derive",
-        r#####"
-struct Point {
-    x: u32,
-    y: u32,<|>
-}
-"#####,
-        r#####"
-#[derive($0)]
-struct Point {
-    x: u32,
-    y: u32,
-}
-"#####,
-    )
-}
-
-#[test]
 fn doctest_add_explicit_type() {
     check_doc_test(
         "add_explicit_type",
@@ -59,52 +39,6 @@ fn main() {
 }
 
 #[test]
-fn doctest_add_from_impl_for_enum() {
-    check_doc_test(
-        "add_from_impl_for_enum",
-        r#####"
-enum A { <|>One(u32) }
-"#####,
-        r#####"
-enum A { One(u32) }
-
-impl From<u32> for A {
-    fn from(v: u32) -> Self {
-        A::One(v)
-    }
-}
-"#####,
-    )
-}
-
-#[test]
-fn doctest_add_function() {
-    check_doc_test(
-        "add_function",
-        r#####"
-struct Baz;
-fn baz() -> Baz { Baz }
-fn foo() {
-    bar<|>("", baz());
-}
-
-"#####,
-        r#####"
-struct Baz;
-fn baz() -> Baz { Baz }
-fn foo() {
-    bar("", baz());
-}
-
-fn bar(arg: &str, baz: Baz) {
-    ${0:todo!()}
-}
-
-"#####,
-    )
-}
-
-#[test]
 fn doctest_add_hash() {
     check_doc_test(
         "add_hash",
@@ -116,27 +50,6 @@ fn main() {
         r#####"
 fn main() {
     r##"Hello, World!"##;
-}
-"#####,
-    )
-}
-
-#[test]
-fn doctest_add_impl() {
-    check_doc_test(
-        "add_impl",
-        r#####"
-struct Ctx<T: Clone> {
-    data: T,<|>
-}
-"#####,
-        r#####"
-struct Ctx<T: Clone> {
-    data: T,
-}
-
-impl<T: Clone> Ctx<T> {
-    $0
 }
 "#####,
     )
@@ -204,28 +117,6 @@ impl Trait<u32> for () {
     }
 
 }
-"#####,
-    )
-}
-
-#[test]
-fn doctest_add_new() {
-    check_doc_test(
-        "add_new",
-        r#####"
-struct Ctx<T: Clone> {
-     data: T,<|>
-}
-"#####,
-        r#####"
-struct Ctx<T: Clone> {
-     data: T,
-}
-
-impl<T: Clone> Ctx<T> {
-    fn $0new(data: T) -> Self { Self { data } }
-}
-
 "#####,
     )
 }
@@ -338,6 +229,39 @@ fn main() {
 }
 
 #[test]
+fn doctest_extract_struct_from_enum_variant() {
+    check_doc_test(
+        "extract_struct_from_enum_variant",
+        r#####"
+enum A { <|>One(u32, u32) }
+"#####,
+        r#####"
+struct One(pub u32, pub u32);
+
+enum A { One(One) }
+"#####,
+    )
+}
+
+#[test]
+fn doctest_extract_variable() {
+    check_doc_test(
+        "extract_variable",
+        r#####"
+fn main() {
+    <|>(1 + 2)<|> * 4;
+}
+"#####,
+        r#####"
+fn main() {
+    let $0var_name = (1 + 2);
+    var_name * 4;
+}
+"#####,
+    )
+}
+
+#[test]
 fn doctest_fill_match_arms() {
     check_doc_test(
         "fill_match_arms",
@@ -434,6 +358,115 @@ fn foo<T: Copy + Clone>() { }
 }
 
 #[test]
+fn doctest_generate_derive() {
+    check_doc_test(
+        "generate_derive",
+        r#####"
+struct Point {
+    x: u32,
+    y: u32,<|>
+}
+"#####,
+        r#####"
+#[derive($0)]
+struct Point {
+    x: u32,
+    y: u32,
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_generate_from_impl_for_enum() {
+    check_doc_test(
+        "generate_from_impl_for_enum",
+        r#####"
+enum A { <|>One(u32) }
+"#####,
+        r#####"
+enum A { One(u32) }
+
+impl From<u32> for A {
+    fn from(v: u32) -> Self {
+        A::One(v)
+    }
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_generate_function() {
+    check_doc_test(
+        "generate_function",
+        r#####"
+struct Baz;
+fn baz() -> Baz { Baz }
+fn foo() {
+    bar<|>("", baz());
+}
+
+"#####,
+        r#####"
+struct Baz;
+fn baz() -> Baz { Baz }
+fn foo() {
+    bar("", baz());
+}
+
+fn bar(arg: &str, baz: Baz) {
+    ${0:todo!()}
+}
+
+"#####,
+    )
+}
+
+#[test]
+fn doctest_generate_impl() {
+    check_doc_test(
+        "generate_impl",
+        r#####"
+struct Ctx<T: Clone> {
+    data: T,<|>
+}
+"#####,
+        r#####"
+struct Ctx<T: Clone> {
+    data: T,
+}
+
+impl<T: Clone> Ctx<T> {
+    $0
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_generate_new() {
+    check_doc_test(
+        "generate_new",
+        r#####"
+struct Ctx<T: Clone> {
+     data: T,<|>
+}
+"#####,
+        r#####"
+struct Ctx<T: Clone> {
+     data: T,
+}
+
+impl<T: Clone> Ctx<T> {
+    fn $0new(data: T) -> Self { Self { data } }
+}
+
+"#####,
+    )
+}
+
+#[test]
 fn doctest_inline_local_variable() {
     check_doc_test(
         "inline_local_variable",
@@ -471,24 +504,6 @@ impl<'a> Cursor<'a> {
             Cursor::Replace(node) | Cursor::Before(node) => node,
         }
     }
-}
-"#####,
-    )
-}
-
-#[test]
-fn doctest_introduce_variable() {
-    check_doc_test(
-        "introduce_variable",
-        r#####"
-fn main() {
-    <|>(1 + 2)<|> * 4;
-}
-"#####,
-        r#####"
-fn main() {
-    let $0var_name = (1 + 2);
-    var_name * 4;
 }
 "#####,
     )

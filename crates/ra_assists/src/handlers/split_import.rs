@@ -2,7 +2,7 @@ use std::iter::successors;
 
 use ra_syntax::{ast, AstNode, T};
 
-use crate::{AssistContext, AssistId, Assists};
+use crate::{AssistContext, AssistId, AssistKind, Assists};
 
 // Assist: split_import
 //
@@ -28,7 +28,7 @@ pub(crate) fn split_import(acc: &mut Assists, ctx: &AssistContext) -> Option<()>
     }
 
     let target = colon_colon.text_range();
-    acc.add(AssistId("split_import"), "Split import", target, |edit| {
+    acc.add(AssistId("split_import", AssistKind::RefactorRewrite), "Split import", target, |edit| {
         edit.replace_ast(use_tree, new_tree);
     })
 }
@@ -65,5 +65,15 @@ mod tests {
     #[test]
     fn issue4044() {
         check_assist_not_applicable(split_import, "use crate::<|>:::self;")
+    }
+
+    #[test]
+    fn test_empty_use() {
+        check_assist_not_applicable(
+            split_import,
+            r"
+use std::<|>
+fn main() {}",
+        );
     }
 }

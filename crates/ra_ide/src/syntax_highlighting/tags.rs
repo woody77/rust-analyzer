@@ -23,15 +23,16 @@ pub enum HighlightTag {
     Constant,
     Enum,
     EnumVariant,
+    EscapeSequence,
     Field,
-    FormatSpecifier,
     Function,
+    Generic,
     Keyword,
     Lifetime,
     Macro,
     Module,
     NumericLiteral,
-    Operator,
+    Punctuation,
     SelfKeyword,
     SelfType,
     Static,
@@ -41,8 +42,11 @@ pub enum HighlightTag {
     TypeAlias,
     TypeParam,
     Union,
+    ValueParam,
     Local,
     UnresolvedReference,
+    FormatSpecifier,
+    Operator,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -55,6 +59,8 @@ pub enum HighlightModifier {
     /// `foo` in `fn foo(x: i32)` is a definition, `foo` in `foo(90 + 2)` is
     /// not.
     Definition,
+    Documentation,
+    Injected,
     Mutable,
     Unsafe,
 }
@@ -71,11 +77,14 @@ impl HighlightTag {
             HighlightTag::Constant => "constant",
             HighlightTag::Enum => "enum",
             HighlightTag::EnumVariant => "enum_variant",
+            HighlightTag::EscapeSequence => "escape_sequence",
             HighlightTag::Field => "field",
             HighlightTag::FormatSpecifier => "format_specifier",
             HighlightTag::Function => "function",
+            HighlightTag::Generic => "generic",
             HighlightTag::Keyword => "keyword",
             HighlightTag::Lifetime => "lifetime",
+            HighlightTag::Punctuation => "punctuation",
             HighlightTag::Macro => "macro",
             HighlightTag::Module => "module",
             HighlightTag::NumericLiteral => "numeric_literal",
@@ -89,6 +98,7 @@ impl HighlightTag {
             HighlightTag::TypeAlias => "type_alias",
             HighlightTag::TypeParam => "type_param",
             HighlightTag::Union => "union",
+            HighlightTag::ValueParam => "value_param",
             HighlightTag::Local => "variable",
             HighlightTag::UnresolvedReference => "unresolved_reference",
         }
@@ -106,6 +116,8 @@ impl HighlightModifier {
         HighlightModifier::Attribute,
         HighlightModifier::ControlFlow,
         HighlightModifier::Definition,
+        HighlightModifier::Documentation,
+        HighlightModifier::Injected,
         HighlightModifier::Mutable,
         HighlightModifier::Unsafe,
     ];
@@ -115,6 +127,8 @@ impl HighlightModifier {
             HighlightModifier::Attribute => "attribute",
             HighlightModifier::ControlFlow => "control",
             HighlightModifier::Definition => "declaration",
+            HighlightModifier::Documentation => "documentation",
+            HighlightModifier::Injected => "injected",
             HighlightModifier::Mutable => "mutable",
             HighlightModifier::Unsafe => "unsafe",
         }

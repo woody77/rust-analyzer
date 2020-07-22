@@ -7,16 +7,17 @@ use std::{panic, sync::Arc};
 
 use ra_prof::profile;
 use ra_syntax::{ast, Parse, SourceFile, TextRange, TextSize};
+use rustc_hash::FxHashSet;
 
 pub use crate::{
     cancellation::Canceled,
     input::{
-        CrateGraph, CrateId, CrateName, Dependency, Edition, Env, ExternSource, ExternSourceId,
-        FileId, ProcMacroId, SourceRoot, SourceRootId,
+        CrateData, CrateGraph, CrateId, CrateName, Dependency, Edition, Env, FileId, ProcMacroId,
+        SourceRoot, SourceRootId,
     },
 };
-pub use relative_path::{RelativePath, RelativePathBuf};
 pub use salsa;
+pub use vfs::{file_set::FileSet, VfsPath};
 
 #[macro_export]
 macro_rules! impl_intern_key {
@@ -78,7 +79,7 @@ pub struct FilePosition {
     pub offset: TextSize,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FileRange {
     pub file_id: FileId,
     pub range: TextRange,
@@ -89,15 +90,13 @@ pub const DEFAULT_LRU_CAP: usize = 128;
 pub trait FileLoader {
     /// Text of the file.
     fn file_text(&self, file_id: FileId) -> Arc<String>;
-    fn resolve_relative_path(&self, anchor: FileId, relative_path: &RelativePath)
-        -> Option<FileId>;
-    fn relevant_crates(&self, file_id: FileId) -> Arc<Vec<CrateId>>;
-
-    fn resolve_extern_path(
-        &self,
-        extern_id: ExternSourceId,
-        relative_path: &RelativePath,
-    ) -> Option<FileId>;
+    /// Note that we intentionally accept a `&str` and not a `&Path` here. This
+    /// method exists to handle `#[path = "/some/path.rs"] mod foo;` and such,
+    /// so the input is guaranteed to be utf-8 string. One might be tempted to
+    /// introduce some kind of "utf-8 path with / separators", but that's a bad idea. Behold
+    /// `#[path = "C://no/way"]`
+    fn resolve_path(&self, anchor: FileId, path: &str) -> Option<FileId>;
+    fn relevant_crates(&self, file_id: FileId) -> Arc<FxHashSet<CrateId>>;
 }
 
 /// Database which stores all significant input facts: source code and project
@@ -113,8 +112,8 @@ pub trait SourceDatabase: CheckCanceled + FileLoader + std::fmt::Debug {
     fn crate_graph(&self) -> Arc<CrateGraph>;
 }
 
-fn parse_query(db: &impl SourceDatabase, file_id: FileId) -> Parse<ast::SourceFile> {
-    let _p = profile("parse_query");
+fn parse_query(db: &dyn SourceDatabase, file_id: FileId) -> Parse<ast::SourceFile> {
+    let _p = profile("parse_query").detail(|| format!("{:?}", file_id));
     let text = db.file_text(file_id);
     SourceFile::parse(&*text)
 }
@@ -126,8 +125,6 @@ pub trait SourceDatabaseExt: SourceDatabase {
     #[salsa::input]
     fn file_text(&self, file_id: FileId) -> Arc<String>;
     /// Path to a file, relative to the root of its source root.
-    #[salsa::input]
-    fn file_relative_path(&self, file_id: FileId) -> RelativePathBuf;
     /// Source root of the file.
     #[salsa::input]
     fn file_source_root(&self, file_id: FileId) -> SourceRootId;
@@ -135,16 +132,18 @@ pub trait SourceDatabaseExt: SourceDatabase {
     #[salsa::input]
     fn source_root(&self, id: SourceRootId) -> Arc<SourceRoot>;
 
-    fn source_root_crates(&self, id: SourceRootId) -> Arc<Vec<CrateId>>;
+    fn source_root_crates(&self, id: SourceRootId) -> Arc<FxHashSet<CrateId>>;
 }
 
-fn source_root_crates(
-    db: &(impl SourceDatabaseExt + SourceDatabase),
-    id: SourceRootId,
-) -> Arc<Vec<CrateId>> {
-    let root = db.source_root(id);
+fn source_root_crates(db: &dyn SourceDatabaseExt, id: SourceRootId) -> Arc<FxHashSet<CrateId>> {
     let graph = db.crate_graph();
-    let res = root.walk().filter_map(|it| graph.crate_id_for_crate_root(it)).collect::<Vec<_>>();
+    let res = graph
+        .iter()
+        .filter(|&krate| {
+            let root_file = graph[krate].root_file_id;
+            db.file_source_root(root_file) == id
+        })
+        .collect::<FxHashSet<_>>();
     Arc::new(res)
 }
 
@@ -155,33 +154,15 @@ impl<T: SourceDatabaseExt> FileLoader for FileLoaderDelegate<&'_ T> {
     fn file_text(&self, file_id: FileId) -> Arc<String> {
         SourceDatabaseExt::file_text(self.0, file_id)
     }
-    fn resolve_relative_path(
-        &self,
-        anchor: FileId,
-        relative_path: &RelativePath,
-    ) -> Option<FileId> {
-        let path = {
-            let mut path = self.0.file_relative_path(anchor);
-            assert!(path.pop());
-            path.push(relative_path);
-            path.normalize()
-        };
+    fn resolve_path(&self, anchor: FileId, path: &str) -> Option<FileId> {
+        // FIXME: this *somehow* should be platform agnostic...
         let source_root = self.0.file_source_root(anchor);
         let source_root = self.0.source_root(source_root);
-        source_root.file_by_relative_path(&path)
+        source_root.file_set.resolve_path(anchor, path)
     }
 
-    fn relevant_crates(&self, file_id: FileId) -> Arc<Vec<CrateId>> {
+    fn relevant_crates(&self, file_id: FileId) -> Arc<FxHashSet<CrateId>> {
         let source_root = self.0.file_source_root(file_id);
         self.0.source_root_crates(source_root)
-    }
-
-    fn resolve_extern_path(
-        &self,
-        extern_id: ExternSourceId,
-        relative_path: &RelativePath,
-    ) -> Option<FileId> {
-        let source_root = self.0.source_root(SourceRootId(extern_id.0));
-        source_root.file_by_relative_path(&relative_path)
     }
 }

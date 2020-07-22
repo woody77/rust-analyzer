@@ -1,10 +1,51 @@
-use super::infer_with_mismatches;
-use insta::assert_snapshot;
+use expect::expect;
 use test_utils::mark;
 
-// Infer with some common definitions and impls.
-fn infer(source: &str) -> String {
-    let defs = r#"
+use super::{check_infer, check_infer_with_mismatches};
+
+#[test]
+fn infer_block_expr_type_mismatch() {
+    check_infer(
+        r"
+        fn test() {
+            let a: i32 = { 1i64 };
+        }
+        ",
+        expect![[r"
+            10..40 '{     ...4 }; }': ()
+            20..21 'a': i32
+            29..37 '{ 1i64 }': i64
+            31..35 '1i64': i64
+        "]],
+    );
+}
+
+#[test]
+fn coerce_places() {
+    check_infer(
+        r#"
+        struct S<T> { a: T }
+
+        fn f<T>(_: &[T]) -> T { loop {} }
+        fn g<T>(_: S<&[T]>) -> T { loop {} }
+
+        fn gen<T>() -> *mut [T; 2] { loop {} }
+        fn test1<U>() -> *mut [U] {
+            gen()
+        }
+
+        fn test2() {
+            let arr: &[u8; 1] = &[1];
+
+            let a: &[_] = arr;
+            let b = f(arr);
+            let c: &[_] = { arr };
+            let d = g(S { a: arr });
+            let e: [&[_]; 1] = [arr];
+            let f: [&[_]; 2] = [arr; 2];
+            let g: (&[_], &[_]) = (arr, arr);
+        }
+
         #[lang = "sized"]
         pub trait Sized {}
         #[lang = "unsize"]
@@ -14,331 +55,327 @@ fn infer(source: &str) -> String {
 
         impl<'a, 'b: 'a, T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<&'a U> for &'b T {}
         impl<T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<*mut U> for *mut T {}
-    "#;
-
-    // Append to the end to keep positions unchanged.
-    super::infer(&format!("{}{}", source, defs))
-}
-
-#[test]
-fn infer_block_expr_type_mismatch() {
-    assert_snapshot!(
-        infer(r#"
-fn test() {
-    let a: i32 = { 1i64 };
-}
-"#),
-        @r###"
-    11..41 '{     ...4 }; }': ()
-    21..22 'a': i32
-    30..38 '{ 1i64 }': i64
-    32..36 '1i64': i64
-    "###);
-}
-
-#[test]
-fn coerce_places() {
-    assert_snapshot!(
-        infer(r#"
-struct S<T> { a: T }
-
-fn f<T>(_: &[T]) -> T { loop {} }
-fn g<T>(_: S<&[T]>) -> T { loop {} }
-
-fn gen<T>() -> *mut [T; 2] { loop {} }
-fn test1<U>() -> *mut [U] {
-    gen()
-}
-
-fn test2() {
-    let arr: &[u8; 1] = &[1];
-
-    let a: &[_] = arr;
-    let b = f(arr);
-    let c: &[_] = { arr };
-    let d = g(S { a: arr });
-    let e: [&[_]; 1] = [arr];
-    let f: [&[_]; 2] = [arr; 2];
-    let g: (&[_], &[_]) = (arr, arr);
-}
-"#),
-        @r###"
-    31..32 '_': &[T]
-    45..56 '{ loop {} }': T
-    47..54 'loop {}': !
-    52..54 '{}': ()
-    65..66 '_': S<&[T]>
-    82..93 '{ loop {} }': T
-    84..91 'loop {}': !
-    89..91 '{}': ()
-    122..133 '{ loop {} }': *mut [T; _]
-    124..131 'loop {}': !
-    129..131 '{}': ()
-    160..173 '{     gen() }': *mut [U]
-    166..169 'gen': fn gen<U>() -> *mut [U; _]
-    166..171 'gen()': *mut [U; _]
-    186..420 '{     ...rr); }': ()
-    196..199 'arr': &[u8; _]
-    212..216 '&[1]': &[u8; _]
-    213..216 '[1]': [u8; _]
-    214..215 '1': u8
-    227..228 'a': &[u8]
-    237..240 'arr': &[u8; _]
-    250..251 'b': u8
-    254..255 'f': fn f<u8>(&[u8]) -> u8
-    254..260 'f(arr)': u8
-    256..259 'arr': &[u8; _]
-    270..271 'c': &[u8]
-    280..287 '{ arr }': &[u8]
-    282..285 'arr': &[u8; _]
-    297..298 'd': u8
-    301..302 'g': fn g<u8>(S<&[u8]>) -> u8
-    301..316 'g(S { a: arr })': u8
-    303..315 'S { a: arr }': S<&[u8]>
-    310..313 'arr': &[u8; _]
-    326..327 'e': [&[u8]; _]
-    341..346 '[arr]': [&[u8]; _]
-    342..345 'arr': &[u8; _]
-    356..357 'f': [&[u8]; _]
-    371..379 '[arr; 2]': [&[u8]; _]
-    372..375 'arr': &[u8; _]
-    377..378 '2': usize
-    389..390 'g': (&[u8], &[u8])
-    407..417 '(arr, arr)': (&[u8], &[u8])
-    408..411 'arr': &[u8; _]
-    413..416 'arr': &[u8; _]
-    "###
+        "#,
+        expect![[r"
+            30..31 '_': &[T]
+            44..55 '{ loop {} }': T
+            46..53 'loop {}': !
+            51..53 '{}': ()
+            64..65 '_': S<&[T]>
+            81..92 '{ loop {} }': T
+            83..90 'loop {}': !
+            88..90 '{}': ()
+            121..132 '{ loop {} }': *mut [T; _]
+            123..130 'loop {}': !
+            128..130 '{}': ()
+            159..172 '{     gen() }': *mut [U]
+            165..168 'gen': fn gen<U>() -> *mut [U; _]
+            165..170 'gen()': *mut [U; _]
+            185..419 '{     ...rr); }': ()
+            195..198 'arr': &[u8; _]
+            211..215 '&[1]': &[u8; _]
+            212..215 '[1]': [u8; _]
+            213..214 '1': u8
+            226..227 'a': &[u8]
+            236..239 'arr': &[u8; _]
+            249..250 'b': u8
+            253..254 'f': fn f<u8>(&[u8]) -> u8
+            253..259 'f(arr)': u8
+            255..258 'arr': &[u8; _]
+            269..270 'c': &[u8]
+            279..286 '{ arr }': &[u8]
+            281..284 'arr': &[u8; _]
+            296..297 'd': u8
+            300..301 'g': fn g<u8>(S<&[u8]>) -> u8
+            300..315 'g(S { a: arr })': u8
+            302..314 'S { a: arr }': S<&[u8]>
+            309..312 'arr': &[u8; _]
+            325..326 'e': [&[u8]; _]
+            340..345 '[arr]': [&[u8]; _]
+            341..344 'arr': &[u8; _]
+            355..356 'f': [&[u8]; _]
+            370..378 '[arr; 2]': [&[u8]; _]
+            371..374 'arr': &[u8; _]
+            376..377 '2': usize
+            388..389 'g': (&[u8], &[u8])
+            406..416 '(arr, arr)': (&[u8], &[u8])
+            407..410 'arr': &[u8; _]
+            412..415 'arr': &[u8; _]
+        "]],
     );
 }
 
 #[test]
 fn infer_let_stmt_coerce() {
-    assert_snapshot!(
-        infer(r#"
-fn test() {
-    let x: &[isize] = &[1];
-    let x: *const [isize] = &[1];
-}
-"#),
-        @r###"
-    11..76 '{     ...[1]; }': ()
-    21..22 'x': &[isize]
-    35..39 '&[1]': &[isize; _]
-    36..39 '[1]': [isize; _]
-    37..38 '1': isize
-    49..50 'x': *const [isize]
-    69..73 '&[1]': &[isize; _]
-    70..73 '[1]': [isize; _]
-    71..72 '1': isize
-    "###);
+    check_infer(
+        r"
+        fn test() {
+            let x: &[isize] = &[1];
+            let x: *const [isize] = &[1];
+        }
+        ",
+        expect![[r"
+            10..75 '{     ...[1]; }': ()
+            20..21 'x': &[isize]
+            34..38 '&[1]': &[isize; _]
+            35..38 '[1]': [isize; _]
+            36..37 '1': isize
+            48..49 'x': *const [isize]
+            68..72 '&[1]': &[isize; _]
+            69..72 '[1]': [isize; _]
+            70..71 '1': isize
+        "]],
+    );
 }
 
 #[test]
 fn infer_custom_coerce_unsized() {
-    assert_snapshot!(
-        infer(r#"
-struct A<T: ?Sized>(*const T);
-struct B<T: ?Sized>(*const T);
-struct C<T: ?Sized> { inner: *const T }
+    check_infer(
+        r#"
+        struct A<T: ?Sized>(*const T);
+        struct B<T: ?Sized>(*const T);
+        struct C<T: ?Sized> { inner: *const T }
 
-impl<T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<B<U>> for B<T> {}
-impl<T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<C<U>> for C<T> {}
+        impl<T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<B<U>> for B<T> {}
+        impl<T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<C<U>> for C<T> {}
 
-fn foo1<T>(x: A<[T]>) -> A<[T]> { x }
-fn foo2<T>(x: B<[T]>) -> B<[T]> { x }
-fn foo3<T>(x: C<[T]>) -> C<[T]> { x }
+        fn foo1<T>(x: A<[T]>) -> A<[T]> { x }
+        fn foo2<T>(x: B<[T]>) -> B<[T]> { x }
+        fn foo3<T>(x: C<[T]>) -> C<[T]> { x }
 
-fn test(a: A<[u8; 2]>, b: B<[u8; 2]>, c: C<[u8; 2]>) {
-    let d = foo1(a);
-    let e = foo2(b);
-    let f = foo3(c);
-}
-"#),
-        @r###"
-    258..259 'x': A<[T]>
-    279..284 '{ x }': A<[T]>
-    281..282 'x': A<[T]>
-    296..297 'x': B<[T]>
-    317..322 '{ x }': B<[T]>
-    319..320 'x': B<[T]>
-    334..335 'x': C<[T]>
-    355..360 '{ x }': C<[T]>
-    357..358 'x': C<[T]>
-    370..371 'a': A<[u8; _]>
-    385..386 'b': B<[u8; _]>
-    400..401 'c': C<[u8; _]>
-    415..481 '{     ...(c); }': ()
-    425..426 'd': A<[{unknown}]>
-    429..433 'foo1': fn foo1<{unknown}>(A<[{unknown}]>) -> A<[{unknown}]>
-    429..436 'foo1(a)': A<[{unknown}]>
-    434..435 'a': A<[u8; _]>
-    446..447 'e': B<[u8]>
-    450..454 'foo2': fn foo2<u8>(B<[u8]>) -> B<[u8]>
-    450..457 'foo2(b)': B<[u8]>
-    455..456 'b': B<[u8; _]>
-    467..468 'f': C<[u8]>
-    471..475 'foo3': fn foo3<u8>(C<[u8]>) -> C<[u8]>
-    471..478 'foo3(c)': C<[u8]>
-    476..477 'c': C<[u8; _]>
-    "###
+        fn test(a: A<[u8; 2]>, b: B<[u8; 2]>, c: C<[u8; 2]>) {
+            let d = foo1(a);
+            let e = foo2(b);
+            let f = foo3(c);
+        }
+
+
+        #[lang = "sized"]
+        pub trait Sized {}
+        #[lang = "unsize"]
+        pub trait Unsize<T: ?Sized> {}
+        #[lang = "coerce_unsized"]
+        pub trait CoerceUnsized<T> {}
+
+        impl<'a, 'b: 'a, T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<&'a U> for &'b T {}
+        impl<T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<*mut U> for *mut T {}
+        "#,
+        expect![[r"
+            257..258 'x': A<[T]>
+            278..283 '{ x }': A<[T]>
+            280..281 'x': A<[T]>
+            295..296 'x': B<[T]>
+            316..321 '{ x }': B<[T]>
+            318..319 'x': B<[T]>
+            333..334 'x': C<[T]>
+            354..359 '{ x }': C<[T]>
+            356..357 'x': C<[T]>
+            369..370 'a': A<[u8; _]>
+            384..385 'b': B<[u8; _]>
+            399..400 'c': C<[u8; _]>
+            414..480 '{     ...(c); }': ()
+            424..425 'd': A<[{unknown}]>
+            428..432 'foo1': fn foo1<{unknown}>(A<[{unknown}]>) -> A<[{unknown}]>
+            428..435 'foo1(a)': A<[{unknown}]>
+            433..434 'a': A<[u8; _]>
+            445..446 'e': B<[u8]>
+            449..453 'foo2': fn foo2<u8>(B<[u8]>) -> B<[u8]>
+            449..456 'foo2(b)': B<[u8]>
+            454..455 'b': B<[u8; _]>
+            466..467 'f': C<[u8]>
+            470..474 'foo3': fn foo3<u8>(C<[u8]>) -> C<[u8]>
+            470..477 'foo3(c)': C<[u8]>
+            475..476 'c': C<[u8; _]>
+        "]],
     );
 }
 
 #[test]
 fn infer_if_coerce() {
-    assert_snapshot!(
-        infer(r#"
-fn foo<T>(x: &[T]) -> &[T] { loop {} }
-fn test() {
-    let x = if true {
-        foo(&[1])
-    } else {
-        &[1]
-    };
-}
-"#),
-        @r###"
-    11..12 'x': &[T]
-    28..39 '{ loop {} }': &[T]
-    30..37 'loop {}': !
-    35..37 '{}': ()
-    50..126 '{     ...  }; }': ()
-    60..61 'x': &[i32]
-    64..123 'if tru...     }': &[i32]
-    67..71 'true': bool
-    72..97 '{     ...     }': &[i32]
-    82..85 'foo': fn foo<i32>(&[i32]) -> &[i32]
-    82..91 'foo(&[1])': &[i32]
-    86..90 '&[1]': &[i32; _]
-    87..90 '[1]': [i32; _]
-    88..89 '1': i32
-    103..123 '{     ...     }': &[i32; _]
-    113..117 '&[1]': &[i32; _]
-    114..117 '[1]': [i32; _]
-    115..116 '1': i32
-    "###
+    check_infer(
+        r#"
+        fn foo<T>(x: &[T]) -> &[T] { loop {} }
+        fn test() {
+            let x = if true {
+                foo(&[1])
+            } else {
+                &[1]
+            };
+        }
+
+
+        #[lang = "sized"]
+        pub trait Sized {}
+        #[lang = "unsize"]
+        pub trait Unsize<T: ?Sized> {}
+        "#,
+        expect![[r"
+            10..11 'x': &[T]
+            27..38 '{ loop {} }': &[T]
+            29..36 'loop {}': !
+            34..36 '{}': ()
+            49..125 '{     ...  }; }': ()
+            59..60 'x': &[i32]
+            63..122 'if tru...     }': &[i32]
+            66..70 'true': bool
+            71..96 '{     ...     }': &[i32]
+            81..84 'foo': fn foo<i32>(&[i32]) -> &[i32]
+            81..90 'foo(&[1])': &[i32]
+            85..89 '&[1]': &[i32; _]
+            86..89 '[1]': [i32; _]
+            87..88 '1': i32
+            102..122 '{     ...     }': &[i32; _]
+            112..116 '&[1]': &[i32; _]
+            113..116 '[1]': [i32; _]
+            114..115 '1': i32
+        "]],
     );
 }
 
 #[test]
 fn infer_if_else_coerce() {
-    assert_snapshot!(
-        infer(r#"
-fn foo<T>(x: &[T]) -> &[T] { loop {} }
-fn test() {
-    let x = if true {
-        &[1]
-    } else {
-        foo(&[1])
-    };
-}
-"#),
-        @r###"
-    11..12 'x': &[T]
-    28..39 '{ loop {} }': &[T]
-    30..37 'loop {}': !
-    35..37 '{}': ()
-    50..126 '{     ...  }; }': ()
-    60..61 'x': &[i32]
-    64..123 'if tru...     }': &[i32]
-    67..71 'true': bool
-    72..92 '{     ...     }': &[i32; _]
-    82..86 '&[1]': &[i32; _]
-    83..86 '[1]': [i32; _]
-    84..85 '1': i32
-    98..123 '{     ...     }': &[i32]
-    108..111 'foo': fn foo<i32>(&[i32]) -> &[i32]
-    108..117 'foo(&[1])': &[i32]
-    112..116 '&[1]': &[i32; _]
-    113..116 '[1]': [i32; _]
-    114..115 '1': i32
-    "###
-    );
+    check_infer(
+        r#"
+        fn foo<T>(x: &[T]) -> &[T] { loop {} }
+        fn test() {
+            let x = if true {
+                &[1]
+            } else {
+                foo(&[1])
+            };
+        }
+
+        #[lang = "sized"]
+        pub trait Sized {}
+        #[lang = "unsize"]
+        pub trait Unsize<T: ?Sized> {}
+        #[lang = "coerce_unsized"]
+        pub trait CoerceUnsized<T> {}
+
+        impl<'a, 'b: 'a, T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<&'a U> for &'b T {}
+        impl<T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<*mut U> for *mut T {}
+        "#,
+        expect![[r"
+            10..11 'x': &[T]
+            27..38 '{ loop {} }': &[T]
+            29..36 'loop {}': !
+            34..36 '{}': ()
+            49..125 '{     ...  }; }': ()
+            59..60 'x': &[i32]
+            63..122 'if tru...     }': &[i32]
+            66..70 'true': bool
+            71..91 '{     ...     }': &[i32; _]
+            81..85 '&[1]': &[i32; _]
+            82..85 '[1]': [i32; _]
+            83..84 '1': i32
+            97..122 '{     ...     }': &[i32]
+            107..110 'foo': fn foo<i32>(&[i32]) -> &[i32]
+            107..116 'foo(&[1])': &[i32]
+            111..115 '&[1]': &[i32; _]
+            112..115 '[1]': [i32; _]
+            113..114 '1': i32
+        "]],
+    )
 }
 
 #[test]
 fn infer_match_first_coerce() {
-    assert_snapshot!(
-        infer(r#"
-fn foo<T>(x: &[T]) -> &[T] { loop {} }
-fn test(i: i32) {
-    let x = match i {
-        2 => foo(&[2]),
-        1 => &[1],
-        _ => &[3],
-    };
-}
-"#),
-        @r###"
-    11..12 'x': &[T]
-    28..39 '{ loop {} }': &[T]
-    30..37 'loop {}': !
-    35..37 '{}': ()
-    48..49 'i': i32
-    56..150 '{     ...  }; }': ()
-    66..67 'x': &[i32]
-    70..147 'match ...     }': &[i32]
-    76..77 'i': i32
-    88..89 '2': i32
-    88..89 '2': i32
-    93..96 'foo': fn foo<i32>(&[i32]) -> &[i32]
-    93..102 'foo(&[2])': &[i32]
-    97..101 '&[2]': &[i32; _]
-    98..101 '[2]': [i32; _]
-    99..100 '2': i32
-    112..113 '1': i32
-    112..113 '1': i32
-    117..121 '&[1]': &[i32; _]
-    118..121 '[1]': [i32; _]
-    119..120 '1': i32
-    131..132 '_': i32
-    136..140 '&[3]': &[i32; _]
-    137..140 '[3]': [i32; _]
-    138..139 '3': i32
-    "###
+    check_infer(
+        r#"
+        fn foo<T>(x: &[T]) -> &[T] { loop {} }
+        fn test(i: i32) {
+            let x = match i {
+                2 => foo(&[2]),
+                1 => &[1],
+                _ => &[3],
+            };
+        }
+
+        #[lang = "sized"]
+        pub trait Sized {}
+        #[lang = "unsize"]
+        pub trait Unsize<T: ?Sized> {}
+        "#,
+        expect![[r"
+            10..11 'x': &[T]
+            27..38 '{ loop {} }': &[T]
+            29..36 'loop {}': !
+            34..36 '{}': ()
+            47..48 'i': i32
+            55..149 '{     ...  }; }': ()
+            65..66 'x': &[i32]
+            69..146 'match ...     }': &[i32]
+            75..76 'i': i32
+            87..88 '2': i32
+            87..88 '2': i32
+            92..95 'foo': fn foo<i32>(&[i32]) -> &[i32]
+            92..101 'foo(&[2])': &[i32]
+            96..100 '&[2]': &[i32; _]
+            97..100 '[2]': [i32; _]
+            98..99 '2': i32
+            111..112 '1': i32
+            111..112 '1': i32
+            116..120 '&[1]': &[i32; _]
+            117..120 '[1]': [i32; _]
+            118..119 '1': i32
+            130..131 '_': i32
+            135..139 '&[3]': &[i32; _]
+            136..139 '[3]': [i32; _]
+            137..138 '3': i32
+    "]],
     );
 }
 
 #[test]
 fn infer_match_second_coerce() {
-    assert_snapshot!(
-        infer(r#"
-fn foo<T>(x: &[T]) -> &[T] { loop {} }
-fn test(i: i32) {
-    let x = match i {
-        1 => &[1],
-        2 => foo(&[2]),
-        _ => &[3],
-    };
-}
-"#),
-        @r###"
-    11..12 'x': &[T]
-    28..39 '{ loop {} }': &[T]
-    30..37 'loop {}': !
-    35..37 '{}': ()
-    48..49 'i': i32
-    56..150 '{     ...  }; }': ()
-    66..67 'x': &[i32]
-    70..147 'match ...     }': &[i32]
-    76..77 'i': i32
-    88..89 '1': i32
-    88..89 '1': i32
-    93..97 '&[1]': &[i32; _]
-    94..97 '[1]': [i32; _]
-    95..96 '1': i32
-    107..108 '2': i32
-    107..108 '2': i32
-    112..115 'foo': fn foo<i32>(&[i32]) -> &[i32]
-    112..121 'foo(&[2])': &[i32]
-    116..120 '&[2]': &[i32; _]
-    117..120 '[2]': [i32; _]
-    118..119 '2': i32
-    131..132 '_': i32
-    136..140 '&[3]': &[i32; _]
-    137..140 '[3]': [i32; _]
-    138..139 '3': i32
-    "###
+    check_infer(
+        r#"
+        fn foo<T>(x: &[T]) -> &[T] { loop {} }
+        fn test(i: i32) {
+            let x = match i {
+                1 => &[1],
+                2 => foo(&[2]),
+                _ => &[3],
+            };
+        }
+
+        #[lang = "sized"]
+        pub trait Sized {}
+        #[lang = "unsize"]
+        pub trait Unsize<T: ?Sized> {}
+        #[lang = "coerce_unsized"]
+        pub trait CoerceUnsized<T> {}
+
+        impl<'a, 'b: 'a, T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<&'a U> for &'b T {}
+        impl<T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<*mut U> for *mut T {}
+        "#,
+        expect![[r"
+            10..11 'x': &[T]
+            27..38 '{ loop {} }': &[T]
+            29..36 'loop {}': !
+            34..36 '{}': ()
+            47..48 'i': i32
+            55..149 '{     ...  }; }': ()
+            65..66 'x': &[i32]
+            69..146 'match ...     }': &[i32]
+            75..76 'i': i32
+            87..88 '1': i32
+            87..88 '1': i32
+            92..96 '&[1]': &[i32; _]
+            93..96 '[1]': [i32; _]
+            94..95 '1': i32
+            106..107 '2': i32
+            106..107 '2': i32
+            111..114 'foo': fn foo<i32>(&[i32]) -> &[i32]
+            111..120 'foo(&[2])': &[i32]
+            115..119 '&[2]': &[i32; _]
+            116..119 '[2]': [i32; _]
+            117..118 '2': i32
+            130..131 '_': i32
+            135..139 '&[3]': &[i32; _]
+            136..139 '[3]': [i32; _]
+            137..138 '3': i32
+    "]],
     );
 }
 
@@ -346,401 +383,453 @@ fn test(i: i32) {
 fn coerce_merge_one_by_one1() {
     mark::check!(coerce_merge_fail_fallback);
 
-    assert_snapshot!(
-        infer(r#"
-fn test() {
-    let t = &mut 1;
-    let x = match 1 {
-        1 => t as *mut i32,
-        2 => t as &i32,
-        _ => t as *const i32,
-    };
-}
-"#),
-        @r###"
-    11..145 '{     ...  }; }': ()
-    21..22 't': &mut i32
-    25..31 '&mut 1': &mut i32
-    30..31 '1': i32
-    41..42 'x': *const i32
-    45..142 'match ...     }': *const i32
-    51..52 '1': i32
-    63..64 '1': i32
-    63..64 '1': i32
-    68..69 't': &mut i32
-    68..81 't as *mut i32': *mut i32
-    91..92 '2': i32
-    91..92 '2': i32
-    96..97 't': &mut i32
-    96..105 't as &i32': &i32
-    115..116 '_': i32
-    120..121 't': &mut i32
-    120..135 't as *const i32': *const i32
-    "###
+    check_infer(
+        r"
+        fn test() {
+            let t = &mut 1;
+            let x = match 1 {
+                1 => t as *mut i32,
+                2 => t as &i32,
+                _ => t as *const i32,
+            };
+        }
+        ",
+        expect![[r"
+            10..144 '{     ...  }; }': ()
+            20..21 't': &mut i32
+            24..30 '&mut 1': &mut i32
+            29..30 '1': i32
+            40..41 'x': *const i32
+            44..141 'match ...     }': *const i32
+            50..51 '1': i32
+            62..63 '1': i32
+            62..63 '1': i32
+            67..68 't': &mut i32
+            67..80 't as *mut i32': *mut i32
+            90..91 '2': i32
+            90..91 '2': i32
+            95..96 't': &mut i32
+            95..104 't as &i32': &i32
+            114..115 '_': i32
+            119..120 't': &mut i32
+            119..134 't as *const i32': *const i32
+    "]],
     );
 }
 
 #[test]
 fn return_coerce_unknown() {
-    assert_snapshot!(
-        infer_with_mismatches(r#"
-fn foo() -> u32 {
-    return unknown;
-}
-"#, true),
-        @r###"
-    17..40 '{     ...own; }': u32
-    23..37 'return unknown': !
-    30..37 'unknown': u32
-    "###
+    check_infer_with_mismatches(
+        r"
+        fn foo() -> u32 {
+            return unknown;
+        }
+        ",
+        expect![[r"
+            16..39 '{     ...own; }': u32
+            22..36 'return unknown': !
+            29..36 'unknown': u32
+        "]],
     );
 }
 
 #[test]
 fn coerce_autoderef() {
-    assert_snapshot!(
-        infer_with_mismatches(r#"
-struct Foo;
-fn takes_ref_foo(x: &Foo) {}
-fn test() {
-    takes_ref_foo(&Foo);
-    takes_ref_foo(&&Foo);
-    takes_ref_foo(&&&Foo);
-}
-"#, true),
-        @r###"
-    30..31 'x': &Foo
-    39..41 '{}': ()
-    52..133 '{     ...oo); }': ()
-    58..71 'takes_ref_foo': fn takes_ref_foo(&Foo)
-    58..77 'takes_...(&Foo)': ()
-    72..76 '&Foo': &Foo
-    73..76 'Foo': Foo
-    83..96 'takes_ref_foo': fn takes_ref_foo(&Foo)
-    83..103 'takes_...&&Foo)': ()
-    97..102 '&&Foo': &&Foo
-    98..102 '&Foo': &Foo
-    99..102 'Foo': Foo
-    109..122 'takes_ref_foo': fn takes_ref_foo(&Foo)
-    109..130 'takes_...&&Foo)': ()
-    123..129 '&&&Foo': &&&Foo
-    124..129 '&&Foo': &&Foo
-    125..129 '&Foo': &Foo
-    126..129 'Foo': Foo
-    "###
+    check_infer_with_mismatches(
+        r"
+        struct Foo;
+        fn takes_ref_foo(x: &Foo) {}
+        fn test() {
+            takes_ref_foo(&Foo);
+            takes_ref_foo(&&Foo);
+            takes_ref_foo(&&&Foo);
+        }
+        ",
+        expect![[r"
+            29..30 'x': &Foo
+            38..40 '{}': ()
+            51..132 '{     ...oo); }': ()
+            57..70 'takes_ref_foo': fn takes_ref_foo(&Foo)
+            57..76 'takes_...(&Foo)': ()
+            71..75 '&Foo': &Foo
+            72..75 'Foo': Foo
+            82..95 'takes_ref_foo': fn takes_ref_foo(&Foo)
+            82..102 'takes_...&&Foo)': ()
+            96..101 '&&Foo': &&Foo
+            97..101 '&Foo': &Foo
+            98..101 'Foo': Foo
+            108..121 'takes_ref_foo': fn takes_ref_foo(&Foo)
+            108..129 'takes_...&&Foo)': ()
+            122..128 '&&&Foo': &&&Foo
+            123..128 '&&Foo': &&Foo
+            124..128 '&Foo': &Foo
+            125..128 'Foo': Foo
+        "]],
     );
 }
 
 #[test]
 fn coerce_autoderef_generic() {
-    assert_snapshot!(
-        infer_with_mismatches(r#"
-struct Foo;
-fn takes_ref<T>(x: &T) -> T { *x }
-fn test() {
-    takes_ref(&Foo);
-    takes_ref(&&Foo);
-    takes_ref(&&&Foo);
-}
-"#, true),
-        @r###"
-    29..30 'x': &T
-    41..47 '{ *x }': T
-    43..45 '*x': T
-    44..45 'x': &T
-    58..127 '{     ...oo); }': ()
-    64..73 'takes_ref': fn takes_ref<Foo>(&Foo) -> Foo
-    64..79 'takes_ref(&Foo)': Foo
-    74..78 '&Foo': &Foo
-    75..78 'Foo': Foo
-    85..94 'takes_ref': fn takes_ref<&Foo>(&&Foo) -> &Foo
-    85..101 'takes_...&&Foo)': &Foo
-    95..100 '&&Foo': &&Foo
-    96..100 '&Foo': &Foo
-    97..100 'Foo': Foo
-    107..116 'takes_ref': fn takes_ref<&&Foo>(&&&Foo) -> &&Foo
-    107..124 'takes_...&&Foo)': &&Foo
-    117..123 '&&&Foo': &&&Foo
-    118..123 '&&Foo': &&Foo
-    119..123 '&Foo': &Foo
-    120..123 'Foo': Foo
-    "###
+    check_infer_with_mismatches(
+        r"
+        struct Foo;
+        fn takes_ref<T>(x: &T) -> T { *x }
+        fn test() {
+            takes_ref(&Foo);
+            takes_ref(&&Foo);
+            takes_ref(&&&Foo);
+        }
+        ",
+        expect![[r"
+            28..29 'x': &T
+            40..46 '{ *x }': T
+            42..44 '*x': T
+            43..44 'x': &T
+            57..126 '{     ...oo); }': ()
+            63..72 'takes_ref': fn takes_ref<Foo>(&Foo) -> Foo
+            63..78 'takes_ref(&Foo)': Foo
+            73..77 '&Foo': &Foo
+            74..77 'Foo': Foo
+            84..93 'takes_ref': fn takes_ref<&Foo>(&&Foo) -> &Foo
+            84..100 'takes_...&&Foo)': &Foo
+            94..99 '&&Foo': &&Foo
+            95..99 '&Foo': &Foo
+            96..99 'Foo': Foo
+            106..115 'takes_ref': fn takes_ref<&&Foo>(&&&Foo) -> &&Foo
+            106..123 'takes_...&&Foo)': &&Foo
+            116..122 '&&&Foo': &&&Foo
+            117..122 '&&Foo': &&Foo
+            118..122 '&Foo': &Foo
+            119..122 'Foo': Foo
+        "]],
     );
 }
 
 #[test]
 fn coerce_autoderef_block() {
-    assert_snapshot!(
-        infer_with_mismatches(r#"
-struct String {}
-#[lang = "deref"]
-trait Deref { type Target; }
-impl Deref for String { type Target = str; }
-fn takes_ref_str(x: &str) {}
-fn returns_string() -> String { loop {} }
-fn test() {
-    takes_ref_str(&{ returns_string() });
-}
-"#, true),
-        @r###"
-    127..128 'x': &str
-    136..138 '{}': ()
-    169..180 '{ loop {} }': String
-    171..178 'loop {}': !
-    176..178 '{}': ()
-    191..236 '{     ... }); }': ()
-    197..210 'takes_ref_str': fn takes_ref_str(&str)
-    197..233 'takes_...g() })': ()
-    211..232 '&{ ret...ng() }': &String
-    212..232 '{ retu...ng() }': String
-    214..228 'returns_string': fn returns_string() -> String
-    214..230 'return...ring()': String
-    "###
+    check_infer_with_mismatches(
+        r#"
+        struct String {}
+        #[lang = "deref"]
+        trait Deref { type Target; }
+        impl Deref for String { type Target = str; }
+        fn takes_ref_str(x: &str) {}
+        fn returns_string() -> String { loop {} }
+        fn test() {
+            takes_ref_str(&{ returns_string() });
+        }
+        "#,
+        expect![[r"
+            126..127 'x': &str
+            135..137 '{}': ()
+            168..179 '{ loop {} }': String
+            170..177 'loop {}': !
+            175..177 '{}': ()
+            190..235 '{     ... }); }': ()
+            196..209 'takes_ref_str': fn takes_ref_str(&str)
+            196..232 'takes_...g() })': ()
+            210..231 '&{ ret...ng() }': &String
+            211..231 '{ retu...ng() }': String
+            213..227 'returns_string': fn returns_string() -> String
+            213..229 'return...ring()': String
+        "]],
     );
 }
 
 #[test]
 fn closure_return_coerce() {
-    assert_snapshot!(
-        infer_with_mismatches(r#"
-fn foo() {
-    let x = || {
-        if true {
-            return &1u32;
+    check_infer_with_mismatches(
+        r"
+        fn foo() {
+            let x = || {
+                if true {
+                    return &1u32;
+                }
+                &&1u32
+            };
         }
-        &&1u32
-    };
-}
-"#, true),
-        @r###"
-    10..106 '{     ...  }; }': ()
-    20..21 'x': || -> &u32
-    24..103 '|| {  ...     }': || -> &u32
-    27..103 '{     ...     }': &u32
-    37..82 'if tru...     }': ()
-    40..44 'true': bool
-    45..82 '{     ...     }': ()
-    59..71 'return &1u32': !
-    66..71 '&1u32': &u32
-    67..71 '1u32': u32
-    91..97 '&&1u32': &&u32
-    92..97 '&1u32': &u32
-    93..97 '1u32': u32
-    "###
+        ",
+        expect![[r"
+            9..105 '{     ...  }; }': ()
+            19..20 'x': || -> &u32
+            23..102 '|| {  ...     }': || -> &u32
+            26..102 '{     ...     }': &u32
+            36..81 'if tru...     }': ()
+            39..43 'true': bool
+            44..81 '{     ...     }': ()
+            58..70 'return &1u32': !
+            65..70 '&1u32': &u32
+            66..70 '1u32': u32
+            90..96 '&&1u32': &&u32
+            91..96 '&1u32': &u32
+            92..96 '1u32': u32
+        "]],
     );
 }
 
 #[test]
 fn coerce_fn_item_to_fn_ptr() {
-    assert_snapshot!(
-        infer_with_mismatches(r#"
-fn foo(x: u32) -> isize { 1 }
-fn test() {
-    let f: fn(u32) -> isize = foo;
-}
-"#, true),
-        @r###"
-    8..9 'x': u32
-    25..30 '{ 1 }': isize
-    27..28 '1': isize
-    41..79 '{     ...foo; }': ()
-    51..52 'f': fn(u32) -> isize
-    73..76 'foo': fn foo(u32) -> isize
-    "###
+    check_infer_with_mismatches(
+        r"
+        fn foo(x: u32) -> isize { 1 }
+        fn test() {
+            let f: fn(u32) -> isize = foo;
+        }
+        ",
+        expect![[r"
+            7..8 'x': u32
+            24..29 '{ 1 }': isize
+            26..27 '1': isize
+            40..78 '{     ...foo; }': ()
+            50..51 'f': fn(u32) -> isize
+            72..75 'foo': fn foo(u32) -> isize
+        "]],
     );
 }
 
 #[test]
 fn coerce_fn_items_in_match_arms() {
     mark::check!(coerce_fn_reification);
-    assert_snapshot!(
-        infer_with_mismatches(r#"
-fn foo1(x: u32) -> isize { 1 }
-fn foo2(x: u32) -> isize { 2 }
-fn foo3(x: u32) -> isize { 3 }
-fn test() {
-    let x = match 1 {
-        1 => foo1,
-        2 => foo2,
-        _ => foo3,
-    };
-}
-"#, true),
-        @r###"
-    9..10 'x': u32
-    26..31 '{ 1 }': isize
-    28..29 '1': isize
-    40..41 'x': u32
-    57..62 '{ 2 }': isize
-    59..60 '2': isize
-    71..72 'x': u32
-    88..93 '{ 3 }': isize
-    90..91 '3': isize
-    104..193 '{     ...  }; }': ()
-    114..115 'x': fn(u32) -> isize
-    118..190 'match ...     }': fn(u32) -> isize
-    124..125 '1': i32
-    136..137 '1': i32
-    136..137 '1': i32
-    141..145 'foo1': fn foo1(u32) -> isize
-    155..156 '2': i32
-    155..156 '2': i32
-    160..164 'foo2': fn foo2(u32) -> isize
-    174..175 '_': i32
-    179..183 'foo3': fn foo3(u32) -> isize
-    "###
+
+    check_infer_with_mismatches(
+        r"
+        fn foo1(x: u32) -> isize { 1 }
+        fn foo2(x: u32) -> isize { 2 }
+        fn foo3(x: u32) -> isize { 3 }
+        fn test() {
+            let x = match 1 {
+                1 => foo1,
+                2 => foo2,
+                _ => foo3,
+            };
+        }
+        ",
+        expect![[r"
+            8..9 'x': u32
+            25..30 '{ 1 }': isize
+            27..28 '1': isize
+            39..40 'x': u32
+            56..61 '{ 2 }': isize
+            58..59 '2': isize
+            70..71 'x': u32
+            87..92 '{ 3 }': isize
+            89..90 '3': isize
+            103..192 '{     ...  }; }': ()
+            113..114 'x': fn(u32) -> isize
+            117..189 'match ...     }': fn(u32) -> isize
+            123..124 '1': i32
+            135..136 '1': i32
+            135..136 '1': i32
+            140..144 'foo1': fn foo1(u32) -> isize
+            154..155 '2': i32
+            154..155 '2': i32
+            159..163 'foo2': fn foo2(u32) -> isize
+            173..174 '_': i32
+            178..182 'foo3': fn foo3(u32) -> isize
+        "]],
     );
 }
 
 #[test]
 fn coerce_closure_to_fn_ptr() {
-    assert_snapshot!(
-        infer_with_mismatches(r#"
-fn test() {
-    let f: fn(u32) -> isize = |x| { 1 };
-}
-"#, true),
-        @r###"
-    11..55 '{     ...1 }; }': ()
-    21..22 'f': fn(u32) -> isize
-    43..52 '|x| { 1 }': |u32| -> isize
-    44..45 'x': u32
-    47..52 '{ 1 }': isize
-    49..50 '1': isize
-    "###
+    check_infer_with_mismatches(
+        r"
+        fn test() {
+            let f: fn(u32) -> isize = |x| { 1 };
+        }
+        ",
+        expect![[r"
+            10..54 '{     ...1 }; }': ()
+            20..21 'f': fn(u32) -> isize
+            42..51 '|x| { 1 }': |u32| -> isize
+            43..44 'x': u32
+            46..51 '{ 1 }': isize
+            48..49 '1': isize
+        "]],
     );
 }
 
 #[test]
 fn coerce_placeholder_ref() {
     // placeholders should unify, even behind references
-    assert_snapshot!(
-        infer_with_mismatches(r#"
-struct S<T> { t: T }
-impl<TT> S<TT> {
-    fn get(&self) -> &TT {
-        &self.t
-    }
-}
-"#, true),
-        @r###"
-    51..55 'self': &S<TT>
-    64..87 '{     ...     }': &TT
-    74..81 '&self.t': &TT
-    75..79 'self': &S<TT>
-    75..81 'self.t': TT
-    "###
+    check_infer_with_mismatches(
+        r"
+        struct S<T> { t: T }
+        impl<TT> S<TT> {
+            fn get(&self) -> &TT {
+                &self.t
+            }
+        }
+        ",
+        expect![[r"
+            50..54 'self': &S<TT>
+            63..86 '{     ...     }': &TT
+            73..80 '&self.t': &TT
+            74..78 'self': &S<TT>
+            74..80 'self.t': TT
+        "]],
     );
 }
 
 #[test]
 fn coerce_unsize_array() {
-    assert_snapshot!(
-        infer_with_mismatches(r#"
-#[lang = "unsize"]
-pub trait Unsize<T> {}
-#[lang = "coerce_unsized"]
-pub trait CoerceUnsized<T> {}
+    check_infer_with_mismatches(
+        r#"
+        #[lang = "unsize"]
+        pub trait Unsize<T> {}
+        #[lang = "coerce_unsized"]
+        pub trait CoerceUnsized<T> {}
 
-impl<T: Unsize<U>, U> CoerceUnsized<&U> for &T {}
+        impl<T: Unsize<U>, U> CoerceUnsized<&U> for &T {}
 
-fn test() {
-    let f: &[usize] = &[1, 2, 3];
-}
-"#, true),
-        @r###"
-    162..199 '{     ... 3]; }': ()
-    172..173 'f': &[usize]
-    186..196 '&[1, 2, 3]': &[usize; _]
-    187..196 '[1, 2, 3]': [usize; _]
-    188..189 '1': usize
-    191..192 '2': usize
-    194..195 '3': usize
-    "###
+        fn test() {
+            let f: &[usize] = &[1, 2, 3];
+        }
+        "#,
+        expect![[r"
+            161..198 '{     ... 3]; }': ()
+            171..172 'f': &[usize]
+            185..195 '&[1, 2, 3]': &[usize; _]
+            186..195 '[1, 2, 3]': [usize; _]
+            187..188 '1': usize
+            190..191 '2': usize
+            193..194 '3': usize
+        "]],
     );
 }
 
 #[test]
-fn coerce_unsize_trait_object() {
-    assert_snapshot!(
-        infer_with_mismatches(r#"
-#[lang = "unsize"]
-pub trait Unsize<T> {}
-#[lang = "coerce_unsized"]
-pub trait CoerceUnsized<T> {}
+fn coerce_unsize_trait_object_simple() {
+    check_infer_with_mismatches(
+        r#"
+        #[lang = "sized"]
+        pub trait Sized {}
+        #[lang = "unsize"]
+        pub trait Unsize<T> {}
+        #[lang = "coerce_unsized"]
+        pub trait CoerceUnsized<T> {}
 
-impl<T: Unsize<U>, U> CoerceUnsized<&U> for &T {}
+        impl<T: Unsize<U>, U> CoerceUnsized<&U> for &T {}
 
-trait Foo<T, U> {}
-trait Bar<U, T, X>: Foo<T, U> {}
-trait Baz<T, X>: Bar<usize, T, X> {}
+        trait Foo<T, U> {}
+        trait Bar<U, T, X>: Foo<T, U> {}
+        trait Baz<T, X>: Bar<usize, T, X> {}
 
-struct S<T, X>;
-impl<T, X> Foo<T, usize> for S<T, X> {}
-impl<T, X> Bar<usize, T, X> for S<T, X> {}
-impl<T, X> Baz<T, X> for S<T, X> {}
+        struct S<T, X>;
+        impl<T, X> Foo<T, usize> for S<T, X> {}
+        impl<T, X> Bar<usize, T, X> for S<T, X> {}
+        impl<T, X> Baz<T, X> for S<T, X> {}
 
-fn test() {
-    let obj: &dyn Baz<i8, i16> = &S;
-    let obj: &dyn Bar<_, _, _> = obj;
-    let obj: &dyn Foo<_, _> = obj;
-    let obj2: &dyn Baz<i8, i16> = &S;
-    let _: &dyn Foo<_, _> = obj2;
+        fn test() {
+            let obj: &dyn Baz<i8, i16> = &S;
+            let obj: &dyn Bar<_, i8, i16> = &S;
+            let obj: &dyn Foo<i8, _> = &S;
+        }
+        "#,
+        expect![[r"
+            424..539 '{     ... &S; }': ()
+            434..437 'obj': &dyn Baz<i8, i16>
+            459..461 '&S': &S<i8, i16>
+            460..461 'S': S<i8, i16>
+            471..474 'obj': &dyn Bar<usize, i8, i16>
+            499..501 '&S': &S<i8, i16>
+            500..501 'S': S<i8, i16>
+            511..514 'obj': &dyn Foo<i8, usize>
+            534..536 '&S': &S<i8, {unknown}>
+            535..536 'S': S<i8, {unknown}>
+        "]],
+    );
 }
-"#, true),
-        @r###"
-    388..573 '{     ...bj2; }': ()
-    398..401 'obj': &dyn Baz<i8, i16>
-    423..425 '&S': &S<i8, i16>
-    424..425 'S': S<i8, i16>
-    435..438 'obj': &dyn Bar<usize, i8, i16>
-    460..463 'obj': &dyn Baz<i8, i16>
-    473..476 'obj': &dyn Foo<i8, usize>
-    495..498 'obj': &dyn Bar<usize, i8, i16>
-    508..512 'obj2': &dyn Baz<i8, i16>
-    534..536 '&S': &S<i8, i16>
-    535..536 'S': S<i8, i16>
-    546..547 '_': &dyn Foo<i8, usize>
-    566..570 'obj2': &dyn Baz<i8, i16>
-    "###
+
+#[test]
+// The rust reference says this should be possible, but rustc doesn't implement
+// it. We used to support it, but Chalk doesn't.
+#[ignore]
+fn coerce_unsize_trait_object_to_trait_object() {
+    check_infer_with_mismatches(
+        r#"
+        #[lang = "sized"]
+        pub trait Sized {}
+        #[lang = "unsize"]
+        pub trait Unsize<T> {}
+        #[lang = "coerce_unsized"]
+        pub trait CoerceUnsized<T> {}
+
+        impl<T: Unsize<U>, U> CoerceUnsized<&U> for &T {}
+
+        trait Foo<T, U> {}
+        trait Bar<U, T, X>: Foo<T, U> {}
+        trait Baz<T, X>: Bar<usize, T, X> {}
+
+        struct S<T, X>;
+        impl<T, X> Foo<T, usize> for S<T, X> {}
+        impl<T, X> Bar<usize, T, X> for S<T, X> {}
+        impl<T, X> Baz<T, X> for S<T, X> {}
+
+        fn test() {
+            let obj: &dyn Baz<i8, i16> = &S;
+            let obj: &dyn Bar<_, _, _> = obj;
+            let obj: &dyn Foo<_, _> = obj;
+            let obj2: &dyn Baz<i8, i16> = &S;
+            let _: &dyn Foo<_, _> = obj2;
+        }
+        "#,
+        expect![[r"
+            424..609 '{     ...bj2; }': ()
+            434..437 'obj': &dyn Baz<i8, i16>
+            459..461 '&S': &S<i8, i16>
+            460..461 'S': S<i8, i16>
+            471..474 'obj': &dyn Bar<usize, i8, i16>
+            496..499 'obj': &dyn Baz<i8, i16>
+            509..512 'obj': &dyn Foo<i8, usize>
+            531..534 'obj': &dyn Bar<usize, i8, i16>
+            544..548 'obj2': &dyn Baz<i8, i16>
+            570..572 '&S': &S<i8, i16>
+            571..572 'S': S<i8, i16>
+            582..583 '_': &dyn Foo<i8, usize>
+            602..606 'obj2': &dyn Baz<i8, i16>
+        "]],
     );
 }
 
 #[test]
 fn coerce_unsize_super_trait_cycle() {
-    assert_snapshot!(
-        infer_with_mismatches(r#"
-#[lang = "unsize"]
-pub trait Unsize<T> {}
-#[lang = "coerce_unsized"]
-pub trait CoerceUnsized<T> {}
+    check_infer_with_mismatches(
+        r#"
+        #[lang = "sized"]
+        pub trait Sized {}
+        #[lang = "unsize"]
+        pub trait Unsize<T> {}
+        #[lang = "coerce_unsized"]
+        pub trait CoerceUnsized<T> {}
 
-impl<T: Unsize<U>, U> CoerceUnsized<&U> for &T {}
+        impl<T: Unsize<U>, U> CoerceUnsized<&U> for &T {}
 
-trait A {}
-trait B: C + A {}
-trait C: B {}
-trait D: C
+        trait A {}
+        trait B: C + A {}
+        trait C: B {}
+        trait D: C
 
-struct S;
-impl A for S {}
-impl B for S {}
-impl C for S {}
-impl D for S {}
+        struct S;
+        impl A for S {}
+        impl B for S {}
+        impl C for S {}
+        impl D for S {}
 
-fn test() {
-    let obj: &dyn D = &S;
-    let obj: &dyn A = obj;
-}
-"#, true),
-        @r###"
-    292..348 '{     ...obj; }': ()
-    302..305 'obj': &dyn D
-    316..318 '&S': &S
-    317..318 'S': S
-    328..331 'obj': &dyn A
-    342..345 'obj': &dyn D
-    "###
+        fn test() {
+            let obj: &dyn D = &S;
+            let obj: &dyn A = &S;
+        }
+        "#,
+        expect![[r"
+            328..383 '{     ... &S; }': ()
+            338..341 'obj': &dyn D
+            352..354 '&S': &S
+            353..354 'S': S
+            364..367 'obj': &dyn A
+            378..380 '&S': &S
+            379..380 'S': S
+        "]],
     );
 }
 
@@ -749,24 +838,24 @@ fn test() {
 fn coerce_unsize_generic() {
     // FIXME: Implement this
     // https://doc.rust-lang.org/reference/type-coercions.html#unsized-coercions
-    assert_snapshot!(
-        infer_with_mismatches(r#"
-#[lang = "unsize"]
-pub trait Unsize<T> {}
-#[lang = "coerce_unsized"]
-pub trait CoerceUnsized<T> {}
+    check_infer_with_mismatches(
+        r#"
+        #[lang = "unsize"]
+        pub trait Unsize<T> {}
+        #[lang = "coerce_unsized"]
+        pub trait CoerceUnsized<T> {}
 
-impl<T: Unsize<U>, U> CoerceUnsized<&U> for &T {}
+        impl<T: Unsize<U>, U> CoerceUnsized<&U> for &T {}
 
-struct Foo<T> { t: T };
-struct Bar<T>(Foo<T>);
+        struct Foo<T> { t: T };
+        struct Bar<T>(Foo<T>);
 
-fn test() {
-    let _: &Foo<[usize]> = &Foo { t: [1, 2, 3] };
-    let _: &Bar<[usize]> = &Bar(Foo { t: [1, 2, 3] });
-}
-"#, true),
-        @r###"
-    "###
+        fn test() {
+            let _: &Foo<[usize]> = &Foo { t: [1, 2, 3] };
+            let _: &Bar<[usize]> = &Bar(Foo { t: [1, 2, 3] });
+        }
+        "#,
+        expect![[r"
+        "]],
     );
 }

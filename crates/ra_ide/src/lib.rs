@@ -17,37 +17,40 @@ macro_rules! eprintln {
 
 pub mod mock_analysis;
 
+mod markup;
 mod prime_caches;
-mod status;
-mod completion;
-mod runnables;
-mod goto_definition;
-mod goto_type_definition;
-mod goto_implementation;
-mod extend_selection;
-mod hover;
+mod display;
+
 mod call_hierarchy;
 mod call_info;
-mod syntax_highlighting;
+mod completion;
+mod diagnostics;
+mod expand_macro;
+mod extend_selection;
+mod file_structure;
+mod folding_ranges;
+mod goto_definition;
+mod goto_implementation;
+mod goto_type_definition;
+mod hover;
+mod inlay_hints;
+mod join_lines;
+mod matching_brace;
 mod parent_module;
 mod references;
-mod diagnostics;
-mod syntax_tree;
-mod folding_ranges;
-mod join_lines;
-mod typing;
-mod matching_brace;
-mod display;
-mod inlay_hints;
-mod expand_macro;
+mod runnables;
 mod ssr;
+mod status;
+mod syntax_highlighting;
+mod syntax_tree;
+mod typing;
 
 use std::sync::Arc;
 
 use ra_cfg::CfgOptions;
 use ra_db::{
     salsa::{self, ParallelDatabase},
-    CheckCanceled, Env, FileLoader, SourceDatabase,
+    CheckCanceled, Env, FileLoader, FileSet, SourceDatabase, VfsPath,
 };
 use ra_ide_db::{
     symbol_index::{self, FileSymbol},
@@ -59,36 +62,40 @@ use crate::display::ToNav;
 
 pub use crate::{
     call_hierarchy::CallItem,
+    call_info::CallInfo,
     completion::{
         CompletionConfig, CompletionItem, CompletionItemKind, CompletionScore, InsertTextFormat,
     },
     diagnostics::Severity,
-    display::{file_structure, FunctionSignature, NavigationTarget, StructureNode},
+    display::NavigationTarget,
     expand_macro::ExpandedMacro,
+    file_structure::StructureNode,
     folding_ranges::{Fold, FoldKind},
-    hover::HoverResult,
+    hover::{HoverAction, HoverConfig, HoverGotoTypeData, HoverResult},
     inlay_hints::{InlayHint, InlayHintsConfig, InlayKind},
+    markup::Markup,
     references::{Declaration, Reference, ReferenceAccess, ReferenceKind, ReferenceSearchResult},
     runnables::{Runnable, RunnableKind, TestId},
-    ssr::SsrError,
     syntax_highlighting::{
         Highlight, HighlightModifier, HighlightModifiers, HighlightTag, HighlightedRange,
     },
 };
 
-pub use hir::Documentation;
-pub use ra_assists::{AssistConfig, AssistId};
+pub use hir::{Documentation, Semantics};
+pub use ra_assists::{Assist, AssistConfig, AssistId, AssistKind, ResolvedAssist};
 pub use ra_db::{
-    Canceled, CrateGraph, CrateId, Edition, FileId, FilePosition, FileRange, SourceRootId,
+    Canceled, CrateGraph, CrateId, Edition, FileId, FilePosition, FileRange, SourceRoot,
+    SourceRootId,
 };
 pub use ra_ide_db::{
-    change::{AnalysisChange, LibraryData},
+    change::AnalysisChange,
     line_index::{LineCol, LineIndex},
     search::SearchScope,
     source_change::{FileSystemEdit, SourceChange, SourceFileEdit},
     symbol_index::Query,
     RootDatabase,
 };
+pub use ra_ssr::SsrError;
 pub use ra_text_edit::{Indel, TextEdit};
 
 pub type Cancelable<T> = Result<T, Canceled>;
@@ -128,26 +135,10 @@ impl<T> RangeInfo<T> {
     }
 }
 
-/// Contains information about a call site. Specifically the
-/// `FunctionSignature`and current parameter.
-#[derive(Debug)]
-pub struct CallInfo {
-    pub signature: FunctionSignature,
-    pub active_parameter: Option<usize>,
-}
-
 /// `AnalysisHost` stores the current state of the world.
 #[derive(Debug)]
 pub struct AnalysisHost {
     db: RootDatabase,
-}
-
-#[derive(Debug)]
-pub struct Assist {
-    pub id: AssistId,
-    pub label: String,
-    pub group_label: Option<String>,
-    pub source_change: SourceChange,
 }
 
 impl AnalysisHost {
@@ -220,11 +211,14 @@ impl Analysis {
     // `AnalysisHost` for creating a fully-featured analysis.
     pub fn from_single_file(text: String) -> (Analysis, FileId) {
         let mut host = AnalysisHost::default();
-        let source_root = SourceRootId(0);
-        let mut change = AnalysisChange::new();
-        change.add_root(source_root, true);
-        let mut crate_graph = CrateGraph::default();
         let file_id = FileId(0);
+        let mut file_set = FileSet::default();
+        file_set.insert(file_id, VfsPath::new_virtual_path("/main.rs".to_string()));
+        let source_root = SourceRoot::new_local(file_set);
+
+        let mut change = AnalysisChange::new();
+        change.set_roots(vec![source_root]);
+        let mut crate_graph = CrateGraph::default();
         // FIXME: cfg options
         // Default to enable test for single file.
         let mut cfg_options = CfgOptions::default();
@@ -236,9 +230,8 @@ impl Analysis {
             cfg_options,
             Env::default(),
             Default::default(),
-            Default::default(),
         );
-        change.add_file(source_root, file_id, "main.rs".into(), Arc::new(text));
+        change.change_file(file_id, Some(Arc::new(text)));
         change.set_crate_graph(crate_graph);
         host.apply_change(change);
         (host.analysis(), file_id)
@@ -333,7 +326,7 @@ impl Analysis {
     /// Returns a tree representation of symbols in the file. Useful to draw a
     /// file outline.
     pub fn file_structure(&self, file_id: FileId) -> Cancelable<Vec<StructureNode>> {
-        self.with_db(|db| file_structure(&db.parse(file_id).tree()))
+        self.with_db(|db| file_structure::file_structure(&db.parse(file_id).tree()))
     }
 
     /// Returns a list of the places in the file where type hints can be displayed.
@@ -390,7 +383,9 @@ impl Analysis {
         position: FilePosition,
         search_scope: Option<SearchScope>,
     ) -> Cancelable<Option<ReferenceSearchResult>> {
-        self.with_db(|db| references::find_all_refs(db, position, search_scope).map(|it| it.info))
+        self.with_db(|db| {
+            references::find_all_refs(&Semantics::new(db), position, search_scope).map(|it| it.info)
+        })
     }
 
     /// Returns a short text describing element at position.
@@ -448,12 +443,14 @@ impl Analysis {
 
     /// Computes syntax highlighting for the given file
     pub fn highlight(&self, file_id: FileId) -> Cancelable<Vec<HighlightedRange>> {
-        self.with_db(|db| syntax_highlighting::highlight(db, file_id, None))
+        self.with_db(|db| syntax_highlighting::highlight(db, file_id, None, false))
     }
 
     /// Computes syntax highlighting for the given file range.
     pub fn highlight_range(&self, frange: FileRange) -> Cancelable<Vec<HighlightedRange>> {
-        self.with_db(|db| syntax_highlighting::highlight(db, frange.file_id, Some(frange.range)))
+        self.with_db(|db| {
+            syntax_highlighting::highlight(db, frange.file_id, Some(frange.range), false)
+        })
     }
 
     /// Computes syntax highlighting for the given file.
@@ -470,20 +467,23 @@ impl Analysis {
         self.with_db(|db| completion::completions(db, config, position).map(Into::into))
     }
 
-    /// Computes assists (aka code actions aka intentions) for the given
+    /// Computes resolved assists with source changes for the given position.
+    pub fn resolved_assists(
+        &self,
+        config: &AssistConfig,
+        frange: FileRange,
+    ) -> Cancelable<Vec<ResolvedAssist>> {
+        self.with_db(|db| ra_assists::Assist::resolved(db, config, frange))
+    }
+
+    /// Computes unresolved assists (aka code actions aka intentions) for the given
     /// position.
-    pub fn assists(&self, config: &AssistConfig, frange: FileRange) -> Cancelable<Vec<Assist>> {
-        self.with_db(|db| {
-            ra_assists::Assist::resolved(db, config, frange)
-                .into_iter()
-                .map(|assist| Assist {
-                    id: assist.assist.id,
-                    label: assist.assist.label,
-                    group_label: assist.assist.group.map(|it| it.0),
-                    source_change: assist.source_change,
-                })
-                .collect()
-        })
+    pub fn unresolved_assists(
+        &self,
+        config: &AssistConfig,
+        frange: FileRange,
+    ) -> Cancelable<Vec<Assist>> {
+        self.with_db(|db| Assist::unresolved(db, config, frange))
     }
 
     /// Computes the set of diagnostics for the given file.
@@ -508,7 +508,7 @@ impl Analysis {
     ) -> Cancelable<Result<SourceChange, SsrError>> {
         self.with_db(|db| {
             let edits = ssr::parse_search_replace(query, parse_only, db)?;
-            Ok(SourceChange::source_file_edits(edits))
+            Ok(SourceChange::from(edits))
         })
     }
 
@@ -525,78 +525,4 @@ impl Analysis {
 fn analysis_is_send() {
     fn is_send<T: Send>() {}
     is_send::<Analysis>();
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::{display::NavigationTarget, mock_analysis::single_file, Query};
-    use ra_syntax::{
-        SmolStr,
-        SyntaxKind::{FN_DEF, STRUCT_DEF},
-    };
-
-    #[test]
-    fn test_world_symbols_with_no_container() {
-        let code = r#"
-    enum FooInner { }
-    "#;
-
-        let mut symbols = get_symbols_matching(code, "FooInner");
-
-        let s = symbols.pop().unwrap();
-
-        assert_eq!(s.name(), "FooInner");
-        assert!(s.container_name().is_none());
-    }
-
-    #[test]
-    fn test_world_symbols_include_container_name() {
-        let code = r#"
-fn foo() {
-    enum FooInner { }
-}
-    "#;
-
-        let mut symbols = get_symbols_matching(code, "FooInner");
-
-        let s = symbols.pop().unwrap();
-
-        assert_eq!(s.name(), "FooInner");
-        assert_eq!(s.container_name(), Some(&SmolStr::new("foo")));
-
-        let code = r#"
-mod foo {
-    struct FooInner;
-}
-    "#;
-
-        let mut symbols = get_symbols_matching(code, "FooInner");
-
-        let s = symbols.pop().unwrap();
-
-        assert_eq!(s.name(), "FooInner");
-        assert_eq!(s.container_name(), Some(&SmolStr::new("foo")));
-    }
-
-    #[test]
-    fn test_world_symbols_are_case_sensitive() {
-        let code = r#"
-fn foo() {}
-
-struct Foo;
-        "#;
-
-        let symbols = get_symbols_matching(code, "Foo");
-
-        let fn_match = symbols.iter().find(|s| s.name() == "foo").map(|s| s.kind());
-        let struct_match = symbols.iter().find(|s| s.name() == "Foo").map(|s| s.kind());
-
-        assert_eq!(fn_match, Some(FN_DEF));
-        assert_eq!(struct_match, Some(STRUCT_DEF));
-    }
-
-    fn get_symbols_matching(text: &str, query: &str) -> Vec<NavigationTarget> {
-        let (analysis, _) = single_file(text);
-        analysis.symbol_search(Query::new(query.into())).unwrap()
-    }
 }

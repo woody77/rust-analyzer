@@ -3,259 +3,179 @@
 //!
 //! Each tick provides an immutable snapshot of the state as `WorldSnapshot`.
 
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{sync::Arc, time::Instant};
 
-use crossbeam_channel::{unbounded, Receiver};
+use crossbeam_channel::{unbounded, Receiver, Sender};
+use flycheck::FlycheckHandle;
 use lsp_types::Url;
 use parking_lot::RwLock;
-use ra_flycheck::{Flycheck, FlycheckConfig};
-use ra_ide::{
-    Analysis, AnalysisChange, AnalysisHost, CrateGraph, FileId, LibraryData, SourceRootId,
-};
-use ra_project_model::{get_rustc_cfg_options, ProcMacroClient, ProjectWorkspace};
-use ra_vfs::{LineEndings, RootEntry, Vfs, VfsChange, VfsFile, VfsRoot, VfsTask, Watch};
-use relative_path::RelativePathBuf;
-use stdx::format_to;
+use ra_db::{CrateId, VfsPath};
+use ra_ide::{Analysis, AnalysisChange, AnalysisHost, FileId};
+use ra_project_model::{CargoWorkspace, ProcMacroClient, ProjectWorkspace, Target};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
     config::Config,
-    diagnostics::{
-        to_proto::url_from_path_with_drive_lowercasing, CheckFixes, DiagnosticCollection,
-    },
-    main_loop::pending_requests::{CompletedRequest, LatestRequests},
-    vfs_glob::{Glob, RustPackageFilterBuilder},
-    LspError, Result,
+    diagnostics::{CheckFixes, DiagnosticCollection},
+    from_proto,
+    line_endings::LineEndings,
+    main_loop::Task,
+    reload::SourceRootConfig,
+    request_metrics::{LatestRequests, RequestMetrics},
+    thread_pool::TaskPool,
+    to_proto::url_from_abs_path,
+    Result,
 };
-use ra_db::ExternSourceId;
-use rustc_hash::{FxHashMap, FxHashSet};
+use ra_prof::profile;
 
-fn create_flycheck(workspaces: &[ProjectWorkspace], config: &FlycheckConfig) -> Option<Flycheck> {
-    // FIXME: Figure out the multi-workspace situation
-    workspaces
-        .iter()
-        .find_map(|w| match w {
-            ProjectWorkspace::Cargo { cargo, .. } => Some(cargo),
-            ProjectWorkspace::Json { .. } => None,
-        })
-        .map(|cargo| {
-            let cargo_project_root = cargo.workspace_root().to_path_buf();
-            Some(Flycheck::new(config.clone(), cargo_project_root))
-        })
-        .unwrap_or_else(|| {
-            log::warn!("Cargo check watching only supported for cargo workspaces, disabling");
-            None
-        })
+#[derive(Eq, PartialEq, Copy, Clone)]
+pub(crate) enum Status {
+    Loading,
+    Ready,
+    Invalid,
+    NeedsReload,
 }
+
+impl Default for Status {
+    fn default() -> Self {
+        Status::Loading
+    }
+}
+
+// Enforces drop order
+pub(crate) struct Handle<H, C> {
+    pub(crate) handle: H,
+    pub(crate) receiver: C,
+}
+
+pub(crate) type ReqHandler = fn(&mut GlobalState, lsp_server::Response);
+pub(crate) type ReqQueue = lsp_server::ReqQueue<(String, Instant), ReqHandler>;
 
 /// `GlobalState` is the primary mutable state of the language server
 ///
 /// The most interesting components are `vfs`, which stores a consistent
 /// snapshot of the file systems, and `analysis_host`, which stores our
 /// incremental salsa database.
-#[derive(Debug)]
-pub struct GlobalState {
-    pub config: Config,
-    pub local_roots: Vec<PathBuf>,
-    pub workspaces: Arc<Vec<ProjectWorkspace>>,
-    pub analysis_host: AnalysisHost,
-    pub vfs: Arc<RwLock<Vfs>>,
-    pub task_receiver: Receiver<VfsTask>,
-    pub latest_requests: Arc<RwLock<LatestRequests>>,
-    pub flycheck: Option<Flycheck>,
-    pub diagnostics: DiagnosticCollection,
-    pub proc_macro_client: ProcMacroClient,
+///
+/// Note that this struct has more than on impl in various modules!
+pub(crate) struct GlobalState {
+    sender: Sender<lsp_server::Message>,
+    req_queue: ReqQueue,
+    pub(crate) task_pool: Handle<TaskPool<Task>, Receiver<Task>>,
+    pub(crate) loader: Handle<Box<dyn vfs::loader::Handle>, Receiver<vfs::loader::Message>>,
+    pub(crate) flycheck: Option<FlycheckHandle>,
+    pub(crate) flycheck_sender: Sender<flycheck::Message>,
+    pub(crate) flycheck_receiver: Receiver<flycheck::Message>,
+    pub(crate) config: Config,
+    pub(crate) analysis_host: AnalysisHost,
+    pub(crate) diagnostics: DiagnosticCollection,
+    pub(crate) mem_docs: FxHashSet<VfsPath>,
+    pub(crate) vfs: Arc<RwLock<(vfs::Vfs, FxHashMap<FileId, LineEndings>)>>,
+    pub(crate) status: Status,
+    pub(crate) source_root_config: SourceRootConfig,
+    pub(crate) proc_macro_client: ProcMacroClient,
+    pub(crate) workspaces: Arc<Vec<ProjectWorkspace>>,
+    latest_requests: Arc<RwLock<LatestRequests>>,
 }
 
 /// An immutable snapshot of the world's state at a point in time.
-pub struct GlobalStateSnapshot {
-    pub config: Config,
-    pub workspaces: Arc<Vec<ProjectWorkspace>>,
-    pub analysis: Analysis,
-    pub latest_requests: Arc<RwLock<LatestRequests>>,
-    pub check_fixes: CheckFixes,
-    vfs: Arc<RwLock<Vfs>>,
+pub(crate) struct GlobalStateSnapshot {
+    pub(crate) config: Config,
+    pub(crate) analysis: Analysis,
+    pub(crate) check_fixes: CheckFixes,
+    pub(crate) latest_requests: Arc<RwLock<LatestRequests>>,
+    vfs: Arc<RwLock<(vfs::Vfs, FxHashMap<FileId, LineEndings>)>>,
+    pub(crate) workspaces: Arc<Vec<ProjectWorkspace>>,
 }
 
 impl GlobalState {
-    pub fn new(
-        workspaces: Vec<ProjectWorkspace>,
-        lru_capacity: Option<usize>,
-        exclude_globs: &[Glob],
-        watch: Watch,
-        config: Config,
-    ) -> GlobalState {
-        let mut change = AnalysisChange::new();
-
-        let extern_dirs: FxHashSet<_> =
-            workspaces.iter().flat_map(ProjectWorkspace::out_dirs).collect();
-
-        let mut local_roots = Vec::new();
-        let roots: Vec<_> = {
-            let create_filter = |is_member| {
-                RustPackageFilterBuilder::default()
-                    .set_member(is_member)
-                    .exclude(exclude_globs.iter().cloned())
-                    .into_vfs_filter()
-            };
-            workspaces
-                .iter()
-                .flat_map(ProjectWorkspace::to_roots)
-                .map(|pkg_root| {
-                    let path = pkg_root.path().to_owned();
-                    if pkg_root.is_member() {
-                        local_roots.push(path.clone());
-                    }
-                    RootEntry::new(path, create_filter(pkg_root.is_member()))
-                })
-                .chain(
-                    extern_dirs
-                        .iter()
-                        .map(|path| RootEntry::new(path.to_owned(), create_filter(false))),
-                )
-                .collect()
+    pub(crate) fn new(sender: Sender<lsp_server::Message>, config: Config) -> GlobalState {
+        let loader = {
+            let (sender, receiver) = unbounded::<vfs::loader::Message>();
+            let handle: vfs_notify::NotifyHandle =
+                vfs::loader::Handle::spawn(Box::new(move |msg| sender.send(msg).unwrap()));
+            let handle = Box::new(handle) as Box<dyn vfs::loader::Handle>;
+            Handle { handle, receiver }
         };
 
-        let (task_sender, task_receiver) = unbounded();
-        let task_sender = Box::new(move |t| task_sender.send(t).unwrap());
-        let (mut vfs, vfs_roots) = Vfs::new(roots, task_sender, watch);
-
-        let mut extern_source_roots = FxHashMap::default();
-        for r in vfs_roots {
-            let vfs_root_path = vfs.root2path(r);
-            let is_local = local_roots.iter().any(|it| vfs_root_path.starts_with(it));
-            change.add_root(SourceRootId(r.0), is_local);
-            change.set_debug_root_path(SourceRootId(r.0), vfs_root_path.display().to_string());
-
-            // FIXME: add path2root in vfs to simpily this logic
-            if extern_dirs.contains(&vfs_root_path) {
-                extern_source_roots.insert(vfs_root_path, ExternSourceId(r.0));
-            }
-        }
-
-        // FIXME: Read default cfgs from config
-        let default_cfg_options = {
-            let mut opts = get_rustc_cfg_options(config.cargo.target.as_ref());
-            opts.insert_atom("test".into());
-            opts.insert_atom("debug_assertion".into());
-            opts
+        let task_pool = {
+            let (sender, receiver) = unbounded();
+            let handle = TaskPool::new(sender);
+            Handle { handle, receiver }
         };
 
-        let proc_macro_client = match &config.proc_macro_srv {
-            None => ProcMacroClient::dummy(),
-            Some((path, args)) => match ProcMacroClient::extern_process(path.into(), args) {
-                Ok(it) => it,
-                Err(err) => {
-                    log::error!(
-                        "Failed to run ra_proc_macro_srv from path {}, error: {:?}",
-                        path.display(),
-                        err
-                    );
-                    ProcMacroClient::dummy()
-                }
-            },
-        };
-
-        // Create crate graph from all the workspaces
-        let mut crate_graph = CrateGraph::default();
-        let mut load = |path: &Path| {
-            // Some path from metadata will be non canonicalized, e.g. /foo/../bar/lib.rs
-            let path = path.canonicalize().ok()?;
-            let vfs_file = vfs.load(&path);
-            vfs_file.map(|f| FileId(f.0))
-        };
-        for ws in workspaces.iter() {
-            crate_graph.extend(ws.to_crate_graph(
-                &default_cfg_options,
-                &extern_source_roots,
-                &proc_macro_client,
-                &mut load,
-            ));
-        }
-        change.set_crate_graph(crate_graph);
-
-        let flycheck = config.check.as_ref().and_then(|c| create_flycheck(&workspaces, c));
-
-        let mut analysis_host = AnalysisHost::new(lru_capacity);
-        analysis_host.apply_change(change);
+        let analysis_host = AnalysisHost::new(config.lru_capacity);
+        let (flycheck_sender, flycheck_receiver) = unbounded();
         GlobalState {
+            sender,
+            req_queue: ReqQueue::default(),
+            task_pool,
+            loader,
+            flycheck: None,
+            flycheck_sender,
+            flycheck_receiver,
             config,
-            local_roots,
-            workspaces: Arc::new(workspaces),
             analysis_host,
-            vfs: Arc::new(RwLock::new(vfs)),
-            task_receiver,
-            latest_requests: Default::default(),
-            flycheck,
             diagnostics: Default::default(),
-            proc_macro_client,
+            mem_docs: FxHashSet::default(),
+            vfs: Arc::new(RwLock::new((vfs::Vfs::default(), FxHashMap::default()))),
+            status: Status::default(),
+            source_root_config: SourceRootConfig::default(),
+            proc_macro_client: ProcMacroClient::dummy(),
+            workspaces: Arc::new(Vec::new()),
+            latest_requests: Default::default(),
         }
     }
 
-    pub fn update_configuration(&mut self, config: Config) {
-        self.analysis_host.update_lru_capacity(config.lru_capacity);
-        if config.check != self.config.check {
-            self.flycheck =
-                config.check.as_ref().and_then(|it| create_flycheck(&self.workspaces, it));
-        }
+    pub(crate) fn process_changes(&mut self) -> bool {
+        let _p = profile("GlobalState::process_changes");
+        let mut fs_changes = Vec::new();
+        let mut has_fs_changes = false;
 
-        self.config = config;
-    }
+        let change = {
+            let mut change = AnalysisChange::new();
+            let (vfs, line_endings_map) = &mut *self.vfs.write();
+            let changed_files = vfs.take_changes();
+            if changed_files.is_empty() {
+                return false;
+            }
 
-    /// Returns a vec of libraries
-    /// FIXME: better API here
-    pub fn process_changes(
-        &mut self,
-        roots_scanned: &mut usize,
-    ) -> Option<Vec<(SourceRootId, Vec<(FileId, RelativePathBuf, Arc<String>)>)>> {
-        let changes = self.vfs.write().commit_changes();
-        if changes.is_empty() {
-            return None;
-        }
-        let mut libs = Vec::new();
-        let mut change = AnalysisChange::new();
-        for c in changes {
-            match c {
-                VfsChange::AddRoot { root, files } => {
-                    let root_path = self.vfs.read().root2path(root);
-                    let is_local = self.local_roots.iter().any(|r| root_path.starts_with(r));
-                    if is_local {
-                        *roots_scanned += 1;
-                        for (file, path, text) in files {
-                            change.add_file(SourceRootId(root.0), FileId(file.0), path, text);
-                        }
-                    } else {
-                        let files = files
-                            .into_iter()
-                            .map(|(vfsfile, path, text)| (FileId(vfsfile.0), path, text))
-                            .collect();
-                        libs.push((SourceRootId(root.0), files));
+            for file in changed_files {
+                if file.is_created_or_deleted() {
+                    if let Some(path) = vfs.file_path(file.file_id).as_path() {
+                        fs_changes.push((path.to_path_buf(), file.change_kind));
+                        has_fs_changes = true;
                     }
                 }
-                VfsChange::AddFile { root, file, path, text } => {
-                    change.add_file(SourceRootId(root.0), FileId(file.0), path, text);
-                }
-                VfsChange::RemoveFile { root, file, path } => {
-                    change.remove_file(SourceRootId(root.0), FileId(file.0), path)
-                }
-                VfsChange::ChangeFile { file, text } => {
-                    change.change_file(FileId(file.0), text);
-                }
+
+                let text = if file.exists() {
+                    let bytes = vfs.file_contents(file.file_id).to_vec();
+                    match String::from_utf8(bytes).ok() {
+                        Some(text) => {
+                            let (text, line_endings) = LineEndings::normalize(text);
+                            line_endings_map.insert(file.file_id, line_endings);
+                            Some(Arc::new(text))
+                        }
+                        None => None,
+                    }
+                } else {
+                    None
+                };
+                change.change_file(file.file_id, text);
             }
-        }
+            if has_fs_changes {
+                let roots = self.source_root_config.partition(&vfs);
+                change.set_roots(roots);
+            }
+            change
+        };
+
         self.analysis_host.apply_change(change);
-        Some(libs)
+        self.maybe_refresh(&fs_changes);
+        true
     }
 
-    pub fn add_lib(&mut self, data: LibraryData) {
-        let mut change = AnalysisChange::new();
-        change.add_library(data);
-        self.analysis_host.apply_change(change);
-    }
-
-    pub fn snapshot(&self) -> GlobalStateSnapshot {
+    pub(crate) fn snapshot(&self) -> GlobalStateSnapshot {
         GlobalStateSnapshot {
             config: self.config.clone(),
             workspaces: Arc::clone(&self.workspaces),
@@ -266,82 +186,107 @@ impl GlobalState {
         }
     }
 
-    pub fn maybe_collect_garbage(&mut self) {
-        self.analysis_host.maybe_collect_garbage()
+    pub(crate) fn send_request<R: lsp_types::request::Request>(
+        &mut self,
+        params: R::Params,
+        handler: ReqHandler,
+    ) {
+        let request = self.req_queue.outgoing.register(R::METHOD.to_string(), params, handler);
+        self.send(request.into());
+    }
+    pub(crate) fn complete_request(&mut self, response: lsp_server::Response) {
+        let handler = self.req_queue.outgoing.complete(response.id.clone());
+        handler(self, response)
     }
 
-    pub fn collect_garbage(&mut self) {
-        self.analysis_host.collect_garbage()
+    pub(crate) fn send_notification<N: lsp_types::notification::Notification>(
+        &mut self,
+        params: N::Params,
+    ) {
+        let not = lsp_server::Notification::new(N::METHOD.to_string(), params);
+        self.send(not.into());
     }
 
-    pub fn complete_request(&mut self, request: CompletedRequest) {
-        self.latest_requests.write().record(request)
+    pub(crate) fn register_request(
+        &mut self,
+        request: &lsp_server::Request,
+        request_received: Instant,
+    ) {
+        self.req_queue
+            .incoming
+            .register(request.id.clone(), (request.method.clone(), request_received));
+    }
+    pub(crate) fn respond(&mut self, response: lsp_server::Response) {
+        if let Some((method, start)) = self.req_queue.incoming.complete(response.id.clone()) {
+            let duration = start.elapsed();
+            log::info!("handled req#{} in {:?}", response.id, duration);
+            let metrics = RequestMetrics { id: response.id.clone(), method, duration };
+            self.latest_requests.write().record(metrics);
+            self.send(response.into());
+        }
+    }
+    pub(crate) fn cancel(&mut self, request_id: lsp_server::RequestId) {
+        if let Some(response) = self.req_queue.incoming.cancel(request_id) {
+            self.send(response.into());
+        }
+    }
+
+    fn send(&mut self, message: lsp_server::Message) {
+        self.sender.send(message).unwrap()
+    }
+}
+
+impl Drop for GlobalState {
+    fn drop(&mut self) {
+        self.analysis_host.request_cancellation()
     }
 }
 
 impl GlobalStateSnapshot {
-    pub fn analysis(&self) -> &Analysis {
-        &self.analysis
+    pub(crate) fn url_to_file_id(&self, url: &Url) -> Result<FileId> {
+        url_to_file_id(&self.vfs.read().0, url)
     }
 
-    pub fn uri_to_file_id(&self, uri: &Url) -> Result<FileId> {
-        let path = uri.to_file_path().map_err(|()| format!("invalid uri: {}", uri))?;
-        let file = self.vfs.read().path2file(&path).ok_or_else(|| {
-            // Show warning as this file is outside current workspace
-            // FIXME: just handle such files, and remove `LspError::UNKNOWN_FILE`.
-            LspError {
-                code: LspError::UNKNOWN_FILE,
-                message: "Rust file outside current workspace is not supported yet.".to_string(),
+    pub(crate) fn file_id_to_url(&self, id: FileId) -> Url {
+        file_id_to_url(&self.vfs.read().0, id)
+    }
+
+    pub(crate) fn file_line_endings(&self, id: FileId) -> LineEndings {
+        self.vfs.read().1[&id]
+    }
+
+    pub(crate) fn anchored_path(&self, file_id: FileId, path: &str) -> Url {
+        let mut base = self.vfs.read().0.file_path(file_id);
+        base.pop();
+        let path = base.join(path).unwrap();
+        let path = path.as_path().unwrap();
+        url_from_abs_path(&path)
+    }
+
+    pub(crate) fn cargo_target_for_crate_root(
+        &self,
+        crate_id: CrateId,
+    ) -> Option<(&CargoWorkspace, Target)> {
+        let file_id = self.analysis.crate_root(crate_id).ok()?;
+        let path = self.vfs.read().0.file_path(file_id);
+        let path = path.as_path()?;
+        self.workspaces.iter().find_map(|ws| match ws {
+            ProjectWorkspace::Cargo { cargo, .. } => {
+                cargo.target_by_root(&path).map(|it| (cargo, it))
             }
-        })?;
-        Ok(FileId(file.0))
+            ProjectWorkspace::Json { .. } => None,
+        })
     }
+}
 
-    pub fn file_id_to_uri(&self, id: FileId) -> Result<Url> {
-        let path = self.vfs.read().file2path(VfsFile(id.0));
-        let url = url_from_path_with_drive_lowercasing(path)?;
+pub(crate) fn file_id_to_url(vfs: &vfs::Vfs, id: FileId) -> Url {
+    let path = vfs.file_path(id);
+    let path = path.as_path().unwrap();
+    url_from_abs_path(&path)
+}
 
-        Ok(url)
-    }
-
-    pub fn file_id_to_path(&self, id: FileId) -> PathBuf {
-        self.vfs.read().file2path(VfsFile(id.0))
-    }
-
-    pub fn file_line_endings(&self, id: FileId) -> LineEndings {
-        self.vfs.read().file_line_endings(VfsFile(id.0))
-    }
-
-    pub fn path_to_uri(&self, root: SourceRootId, path: &RelativePathBuf) -> Result<Url> {
-        let base = self.vfs.read().root2path(VfsRoot(root.0));
-        let path = path.to_path(base);
-        let url = Url::from_file_path(&path)
-            .map_err(|_| format!("can't convert path to url: {}", path.display()))?;
-        Ok(url)
-    }
-
-    pub fn status(&self) -> String {
-        let mut buf = String::new();
-        if self.workspaces.is_empty() {
-            buf.push_str("no workspaces\n")
-        } else {
-            buf.push_str("workspaces:\n");
-            for w in self.workspaces.iter() {
-                format_to!(buf, "{} packages loaded\n", w.n_packages());
-            }
-        }
-        buf.push_str("\nanalysis:\n");
-        buf.push_str(
-            &self
-                .analysis
-                .status()
-                .unwrap_or_else(|_| "Analysis retrieval was cancelled".to_owned()),
-        );
-        buf
-    }
-
-    pub fn workspace_root_for(&self, file_id: FileId) -> Option<&Path> {
-        let path = self.vfs.read().file2path(VfsFile(file_id.0));
-        self.workspaces.iter().find_map(|ws| ws.workspace_root_for(&path))
-    }
+pub(crate) fn url_to_file_id(vfs: &vfs::Vfs, url: &Url) -> Result<FileId> {
+    let path = from_proto::vfs_path(url)?;
+    let res = vfs.file_id(&path).ok_or_else(|| format!("file not found: {}", path))?;
+    Ok(res)
 }

@@ -3,6 +3,7 @@ edition = "2018"
 name = "ra_hir_def"
 version = "0.1.0"
 authors = ["rust-analyzer developers"]
+license = "MIT OR Apache-2.0"
 
 [lib]
 doctest = false
@@ -14,6 +15,10 @@ rustc-hash = "1.1.0"
 either = "1.5.3"
 anymap = "0.12.1"
 drop_bomb = "0.1.4"
+fst = { version = "0.4", default-features = false }
+itertools = "0.9.0"
+indexmap = "1.4.0"
+smallvec = "1.4.0"
 
 stdx = { path = "../stdx" }
 
@@ -28,4 +33,4 @@ ra_cfg = { path = "../ra_cfg" }
 tt = { path = "../ra_tt", package = "ra_tt" }
 
 [dev-dependencies]
-insta = "0.16.0"
+expect = { path = "../expect" }

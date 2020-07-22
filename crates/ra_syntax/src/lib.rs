@@ -51,7 +51,8 @@ pub use crate::{
     ptr::{AstPtr, SyntaxNodePtr},
     syntax_error::SyntaxError,
     syntax_node::{
-        Direction, NodeOrToken, SyntaxElement, SyntaxNode, SyntaxToken, SyntaxTreeBuilder,
+        Direction, NodeOrToken, SyntaxElement, SyntaxElementChildren, SyntaxNode,
+        SyntaxNodeChildren, SyntaxToken, SyntaxTreeBuilder,
     },
 };
 pub use ra_parser::{SyntaxKind, T};
@@ -164,6 +165,41 @@ impl SourceFile {
 
         assert_eq!(root.kind(), SyntaxKind::SOURCE_FILE);
         Parse { green, errors: Arc::new(errors), _ty: PhantomData }
+    }
+}
+
+impl ast::Path {
+    /// Returns `text`, parsed as a path, but only if it has no errors.
+    pub fn parse(text: &str) -> Result<Self, ()> {
+        parsing::parse_text_fragment(text, ra_parser::FragmentKind::Path)
+    }
+}
+
+impl ast::Pat {
+    /// Returns `text`, parsed as a pattern, but only if it has no errors.
+    pub fn parse(text: &str) -> Result<Self, ()> {
+        parsing::parse_text_fragment(text, ra_parser::FragmentKind::Pattern)
+    }
+}
+
+impl ast::Expr {
+    /// Returns `text`, parsed as an expression, but only if it has no errors.
+    pub fn parse(text: &str) -> Result<Self, ()> {
+        parsing::parse_text_fragment(text, ra_parser::FragmentKind::Expr)
+    }
+}
+
+impl ast::ModuleItem {
+    /// Returns `text`, parsed as an item, but only if it has no errors.
+    pub fn parse(text: &str) -> Result<Self, ()> {
+        parsing::parse_text_fragment(text, ra_parser::FragmentKind::Item)
+    }
+}
+
+impl ast::TypeRef {
+    /// Returns `text`, parsed as an type reference, but only if it has no errors.
+    pub fn parse(text: &str) -> Result<Self, ()> {
+        parsing::parse_text_fragment(text, ra_parser::FragmentKind::Type)
     }
 }
 

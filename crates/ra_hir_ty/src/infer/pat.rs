@@ -4,7 +4,7 @@ use std::iter::repeat;
 use std::sync::Arc;
 
 use hir_def::{
-    expr::{BindingAnnotation, Pat, PatId, RecordFieldPat},
+    expr::{BindingAnnotation, Expr, Literal, Pat, PatId, RecordFieldPat},
     path::Path,
     type_ref::Mutability,
     FieldId,
@@ -90,18 +90,7 @@ impl<'a> InferenceContext<'a> {
     ) -> Ty {
         let body = Arc::clone(&self.body); // avoid borrow checker problem
 
-        let is_non_ref_pat = match &body[pat] {
-            Pat::Tuple { .. }
-            | Pat::Or(..)
-            | Pat::TupleStruct { .. }
-            | Pat::Record { .. }
-            | Pat::Range { .. }
-            | Pat::Slice { .. } => true,
-            // FIXME: Path/Lit might actually evaluate to ref, but inference is unimplemented.
-            Pat::Path(..) | Pat::Lit(..) => true,
-            Pat::Wild | Pat::Bind { .. } | Pat::Ref { .. } | Pat::Missing => false,
-        };
-        if is_non_ref_pat {
+        if is_non_ref_pat(&body, pat) {
             while let Some((inner, mutability)) = expected.as_reference() {
                 expected = inner;
                 default_bm = match default_bm {
@@ -195,7 +184,7 @@ impl<'a> InferenceContext<'a> {
                 self.write_pat_ty(pat, bound_ty);
                 return inner_ty;
             }
-            Pat::Slice { prefix, slice: _slice, suffix } => {
+            Pat::Slice { prefix, slice, suffix } => {
                 let (container_ty, elem_ty) = match &expected {
                     ty_app!(TypeCtor::Array, st) => (TypeCtor::Array, st.as_single().clone()),
                     ty_app!(TypeCtor::Slice, st) => (TypeCtor::Slice, st.as_single().clone()),
@@ -206,7 +195,12 @@ impl<'a> InferenceContext<'a> {
                     self.infer_pat(*pat_id, &elem_ty, default_bm);
                 }
 
-                Ty::apply_one(container_ty, elem_ty)
+                let pat_ty = Ty::apply_one(container_ty, elem_ty);
+                if let Some(slice_pat_id) = slice {
+                    self.infer_pat(*slice_pat_id, &pat_ty, default_bm);
+                }
+
+                pat_ty
             }
             Pat::Wild => expected.clone(),
             Pat::Range { start, end } => {
@@ -225,5 +219,23 @@ impl<'a> InferenceContext<'a> {
         let ty = self.resolve_ty_as_possible(ty);
         self.write_pat_ty(pat, ty.clone());
         ty
+    }
+}
+
+fn is_non_ref_pat(body: &hir_def::body::Body, pat: PatId) -> bool {
+    match &body[pat] {
+        Pat::Tuple { .. }
+        | Pat::TupleStruct { .. }
+        | Pat::Record { .. }
+        | Pat::Range { .. }
+        | Pat::Slice { .. } => true,
+        Pat::Or(pats) => pats.iter().all(|p| is_non_ref_pat(body, *p)),
+        // FIXME: Path/Lit might actually evaluate to ref, but inference is unimplemented.
+        Pat::Path(..) => true,
+        Pat::Lit(expr) => match body[*expr] {
+            Expr::Literal(Literal::String(..)) => false,
+            _ => true,
+        },
+        Pat::Wild | Pat::Bind { .. } | Pat::Ref { .. } | Pat::Missing => false,
     }
 }

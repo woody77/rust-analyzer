@@ -58,7 +58,7 @@ pub struct CompletionItem {
     score: Option<CompletionScore>,
 }
 
-// We use custom debug for CompletionItem to make `insta`'s diffs more readable.
+// We use custom debug for CompletionItem to make snapshot tests more readable.
 impl fmt::Debug for CompletionItem {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let mut s = f.debug_struct("CompletionItem");
@@ -95,7 +95,7 @@ impl fmt::Debug for CompletionItem {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Ord, PartialOrd, Eq, PartialEq)]
 pub enum CompletionScore {
     /// If only type match
     TypeMatch,
@@ -123,6 +123,34 @@ pub enum CompletionItemKind {
     TypeParam,
     Macro,
     Attribute,
+    UnresolvedReference,
+}
+
+impl CompletionItemKind {
+    #[cfg(test)]
+    pub(crate) fn tag(&self) -> &'static str {
+        match self {
+            CompletionItemKind::Attribute => "at",
+            CompletionItemKind::Binding => "bn",
+            CompletionItemKind::BuiltinType => "bt",
+            CompletionItemKind::Const => "ct",
+            CompletionItemKind::Enum => "en",
+            CompletionItemKind::EnumVariant => "ev",
+            CompletionItemKind::Field => "fd",
+            CompletionItemKind::Function => "fn",
+            CompletionItemKind::Keyword => "kw",
+            CompletionItemKind::Macro => "ma",
+            CompletionItemKind::Method => "me",
+            CompletionItemKind::Module => "md",
+            CompletionItemKind::Snippet => "sn",
+            CompletionItemKind::Static => "sc",
+            CompletionItemKind::Struct => "st",
+            CompletionItemKind::Trait => "tt",
+            CompletionItemKind::TypeAlias => "ta",
+            CompletionItemKind::TypeParam => "tp",
+            CompletionItemKind::UnresolvedReference => "??",
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]

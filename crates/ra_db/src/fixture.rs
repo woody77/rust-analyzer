@@ -57,17 +57,16 @@
 //! fn insert_source_code_here() {}
 //! "
 //! ```
-
-use std::str::FromStr;
-use std::sync::Arc;
+use std::{str::FromStr, sync::Arc};
 
 use ra_cfg::CfgOptions;
 use rustc_hash::FxHashMap;
-use test_utils::{extract_offset, parse_fixture, parse_single_fixture, FixtureMeta, CURSOR_MARKER};
+use test_utils::{extract_range_or_offset, Fixture, RangeOrOffset, CURSOR_MARKER};
+use vfs::{file_set::FileSet, VfsPath};
 
 use crate::{
-    input::CrateName, CrateGraph, CrateId, Edition, Env, FileId, FilePosition, RelativePathBuf,
-    SourceDatabaseExt, SourceRoot, SourceRootId,
+    input::CrateName, CrateGraph, CrateId, Edition, Env, FileId, FilePosition, SourceDatabaseExt,
+    SourceRoot, SourceRootId,
 };
 
 pub const WORKSPACE: SourceRootId = SourceRootId(0);
@@ -75,21 +74,32 @@ pub const WORKSPACE: SourceRootId = SourceRootId(0);
 pub trait WithFixture: Default + SourceDatabaseExt + 'static {
     fn with_single_file(text: &str) -> (Self, FileId) {
         let mut db = Self::default();
-        let file_id = with_single_file(&mut db, text);
-        (db, file_id)
+        let (_, files) = with_files(&mut db, text);
+        assert_eq!(files.len(), 1);
+        (db, files[0])
     }
 
     fn with_files(ra_fixture: &str) -> Self {
         let mut db = Self::default();
-        let pos = with_files(&mut db, ra_fixture);
+        let (pos, _) = with_files(&mut db, ra_fixture);
         assert!(pos.is_none());
         db
     }
 
     fn with_position(ra_fixture: &str) -> (Self, FilePosition) {
+        let (db, file_id, range_or_offset) = Self::with_range_or_offset(ra_fixture);
+        let offset = match range_or_offset {
+            RangeOrOffset::Range(_) => panic!(),
+            RangeOrOffset::Offset(it) => it,
+        };
+        (db, FilePosition { file_id, offset })
+    }
+
+    fn with_range_or_offset(ra_fixture: &str) -> (Self, FileId, RangeOrOffset) {
         let mut db = Self::default();
-        let pos = with_files(&mut db, ra_fixture);
-        (db, pos.unwrap())
+        let (pos, _) = with_files(&mut db, ra_fixture);
+        let (file_id, range_or_offset) = pos.unwrap();
+        (db, file_id, range_or_offset)
     }
 
     fn test_crate(&self) -> CrateId {
@@ -103,119 +113,64 @@ pub trait WithFixture: Default + SourceDatabaseExt + 'static {
 
 impl<DB: SourceDatabaseExt + Default + 'static> WithFixture for DB {}
 
-fn with_single_file(db: &mut dyn SourceDatabaseExt, ra_fixture: &str) -> FileId {
-    let file_id = FileId(0);
-    let rel_path: RelativePathBuf = "/main.rs".into();
+fn with_files(
+    db: &mut dyn SourceDatabaseExt,
+    fixture: &str,
+) -> (Option<(FileId, RangeOrOffset)>, Vec<FileId>) {
+    let fixture = Fixture::parse(fixture);
 
-    let mut source_root = SourceRoot::new_local();
-    source_root.insert_file(rel_path.clone(), file_id);
-
-    let fixture = parse_single_fixture(ra_fixture);
-
-    let crate_graph = if let Some(entry) = fixture {
-        let meta = match ParsedMeta::from(&entry.meta) {
-            ParsedMeta::File(it) => it,
-            _ => panic!("with_single_file only support file meta"),
-        };
-
-        let mut crate_graph = CrateGraph::default();
-        crate_graph.add_crate_root(
-            file_id,
-            meta.edition,
-            meta.krate.map(|name| {
-                CrateName::new(&name).expect("Fixture crate name should not contain dashes")
-            }),
-            meta.cfg,
-            meta.env,
-            Default::default(),
-            Default::default(),
-        );
-        crate_graph
-    } else {
-        let mut crate_graph = CrateGraph::default();
-        crate_graph.add_crate_root(
-            file_id,
-            Edition::Edition2018,
-            None,
-            CfgOptions::default(),
-            Env::default(),
-            Default::default(),
-            Default::default(),
-        );
-        crate_graph
-    };
-
-    db.set_file_text(file_id, Arc::new(ra_fixture.to_string()));
-    db.set_file_relative_path(file_id, rel_path);
-    db.set_file_source_root(file_id, WORKSPACE);
-    db.set_source_root(WORKSPACE, Arc::new(source_root));
-    db.set_crate_graph(Arc::new(crate_graph));
-
-    file_id
-}
-
-fn with_files(db: &mut dyn SourceDatabaseExt, fixture: &str) -> Option<FilePosition> {
-    let fixture = parse_fixture(fixture);
-
+    let mut files = Vec::new();
     let mut crate_graph = CrateGraph::default();
     let mut crates = FxHashMap::default();
     let mut crate_deps = Vec::new();
     let mut default_crate_root: Option<FileId> = None;
 
-    let mut source_root = SourceRoot::new_local();
-    let mut source_root_id = WORKSPACE;
-    let mut source_root_prefix: RelativePathBuf = "/".into();
+    let mut file_set = FileSet::default();
+    let source_root_id = WORKSPACE;
+    let source_root_prefix = "/".to_string();
     let mut file_id = FileId(0);
 
     let mut file_position = None;
 
-    for entry in fixture.iter() {
-        let meta = match ParsedMeta::from(&entry.meta) {
-            ParsedMeta::Root { path } => {
-                let source_root = std::mem::replace(&mut source_root, SourceRoot::new_local());
-                db.set_source_root(source_root_id, Arc::new(source_root));
-                source_root_id.0 += 1;
-                source_root_prefix = path;
-                continue;
-            }
-            ParsedMeta::File(it) => it,
+    for entry in fixture {
+        let text = if entry.text.contains(CURSOR_MARKER) {
+            let (range_or_offset, text) = extract_range_or_offset(&entry.text);
+            assert!(file_position.is_none());
+            file_position = Some((file_id, range_or_offset));
+            text.to_string()
+        } else {
+            entry.text.clone()
         };
+
+        let meta = FileMeta::from(entry);
         assert!(meta.path.starts_with(&source_root_prefix));
 
         if let Some(krate) = meta.krate {
             let crate_id = crate_graph.add_crate_root(
                 file_id,
                 meta.edition,
-                Some(CrateName::new(&krate).unwrap()),
+                Some(krate.clone()),
                 meta.cfg,
                 meta.env,
                 Default::default(),
-                Default::default(),
             );
-            let prev = crates.insert(krate.clone(), crate_id);
+            let crate_name = CrateName::new(&krate).unwrap();
+            let prev = crates.insert(crate_name.clone(), crate_id);
             assert!(prev.is_none());
             for dep in meta.deps {
-                crate_deps.push((krate.clone(), dep))
+                let dep = CrateName::new(&dep).unwrap();
+                crate_deps.push((crate_name.clone(), dep))
             }
         } else if meta.path == "/main.rs" || meta.path == "/lib.rs" {
             assert!(default_crate_root.is_none());
             default_crate_root = Some(file_id);
         }
 
-        let text = if entry.text.contains(CURSOR_MARKER) {
-            let (offset, text) = extract_offset(&entry.text);
-            assert!(file_position.is_none());
-            file_position = Some(FilePosition { file_id, offset });
-            text.to_string()
-        } else {
-            entry.text.to_string()
-        };
-
         db.set_file_text(file_id, Arc::new(text));
-        db.set_file_relative_path(file_id, meta.path.clone());
         db.set_file_source_root(file_id, source_root_id);
-        source_root.insert_file(meta.path, file_id);
-
+        let path = VfsPath::new_virtual_path(meta.path);
+        file_set.insert(file_id, path.into());
+        files.push(file_id);
         file_id.0 += 1;
     }
 
@@ -228,7 +183,6 @@ fn with_files(db: &mut dyn SourceDatabaseExt, fixture: &str) -> Option<FilePosit
             CfgOptions::default(),
             Env::default(),
             Default::default(),
-            Default::default(),
         );
     } else {
         for (from, to) in crate_deps {
@@ -238,19 +192,14 @@ fn with_files(db: &mut dyn SourceDatabaseExt, fixture: &str) -> Option<FilePosit
         }
     }
 
-    db.set_source_root(source_root_id, Arc::new(source_root));
+    db.set_source_root(source_root_id, Arc::new(SourceRoot::new_local(file_set)));
     db.set_crate_graph(Arc::new(crate_graph));
 
-    file_position
-}
-
-enum ParsedMeta {
-    Root { path: RelativePathBuf },
-    File(FileMeta),
+    (file_position, files)
 }
 
 struct FileMeta {
-    path: RelativePathBuf,
+    path: String,
     krate: Option<String>,
     deps: Vec<String>,
     cfg: CfgOptions,
@@ -258,25 +207,22 @@ struct FileMeta {
     env: Env,
 }
 
-impl From<&FixtureMeta> for ParsedMeta {
-    fn from(meta: &FixtureMeta) -> Self {
-        match meta {
-            FixtureMeta::Root { path } => {
-                // `Self::Root` causes a false warning: 'variant is never constructed: `Root` '
-                // see https://github.com/rust-lang/rust/issues/69018
-                ParsedMeta::Root { path: path.to_owned() }
-            }
-            FixtureMeta::File(f) => Self::File(FileMeta {
-                path: f.path.to_owned(),
-                krate: f.crate_name.to_owned(),
-                deps: f.deps.to_owned(),
-                cfg: f.cfg.to_owned(),
-                edition: f
-                    .edition
-                    .as_ref()
-                    .map_or(Edition::Edition2018, |v| Edition::from_str(&v).unwrap()),
-                env: Env::from(f.env.iter()),
-            }),
+impl From<Fixture> for FileMeta {
+    fn from(f: Fixture) -> FileMeta {
+        let mut cfg = CfgOptions::default();
+        f.cfg_atoms.iter().for_each(|it| cfg.insert_atom(it.into()));
+        f.cfg_key_values.iter().for_each(|(k, v)| cfg.insert_key_value(k.into(), v.into()));
+
+        FileMeta {
+            path: f.path,
+            krate: f.krate,
+            deps: f.deps,
+            cfg,
+            edition: f
+                .edition
+                .as_ref()
+                .map_or(Edition::Edition2018, |v| Edition::from_str(&v).unwrap()),
+            env: Env::from(f.env.iter()),
         }
     }
 }

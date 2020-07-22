@@ -169,10 +169,7 @@ fn is_where_predicate(p: &mut Parser) -> bool {
 }
 
 fn is_where_clause_end(p: &mut Parser) -> bool {
-    match p.current() {
-        T!['{'] | T![;] | T![=] => true,
-        _ => false,
-    }
+    matches!(p.current(), T!['{'] | T![;] | T![=])
 }
 
 fn where_predicate(p: &mut Parser) {
@@ -191,10 +188,14 @@ fn where_predicate(p: &mut Parser) {
         }
         _ => {
             // test where_pred_for
-            // fn test<F>()
+            // fn for_trait<F>()
             // where
             //    for<'a> F: Fn(&'a str)
             // { }
+            if p.at(T![for]) {
+                types::for_binder(p);
+            }
+
             types::type_(p);
 
             if p.at(T![:]) {

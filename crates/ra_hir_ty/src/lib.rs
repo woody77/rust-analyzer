@@ -6,25 +6,6 @@ macro_rules! eprintln {
     ($($tt:tt)*) => { stdx::eprintln!($($tt)*) };
 }
 
-macro_rules! impl_froms {
-    ($e:ident: $($v:ident $(($($sv:ident),*))?),*) => {
-        $(
-            impl From<$v> for $e {
-                fn from(it: $v) -> $e {
-                    $e::$v(it)
-                }
-            }
-            $($(
-                impl From<$sv> for $e {
-                    fn from(it: $sv) -> $e {
-                        $e::$v($v::$sv(it))
-                    }
-                }
-            )*)?
-        )*
-    }
-}
-
 mod autoderef;
 pub mod primitive;
 pub mod traits;
@@ -32,21 +13,18 @@ pub mod method_resolution;
 mod op;
 mod lower;
 pub(crate) mod infer;
-pub mod display;
 pub(crate) mod utils;
+
+pub mod display;
 pub mod db;
 pub mod diagnostics;
-pub mod expr;
 
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod test_db;
-mod _match;
 
-use std::ops::Deref;
-use std::sync::Arc;
-use std::{iter, mem};
+use std::{iter, mem, ops::Deref, sync::Arc};
 
 use hir_def::{
     expr::ExprId,
@@ -54,18 +32,19 @@ use hir_def::{
     AdtId, AssocContainerId, DefWithBodyId, GenericDefId, HasModule, Lookup, TraitId, TypeAliasId,
     TypeParamId,
 };
-use ra_db::{impl_intern_key, salsa, CrateId};
+use itertools::Itertools;
+use ra_db::{salsa, CrateId};
 
 use crate::{
     db::HirDatabase,
-    primitive::{FloatTy, IntTy, Uncertain},
+    display::HirDisplay,
+    primitive::{FloatTy, IntTy},
     utils::{generics, make_mut_slice, Generics},
 };
-use display::HirDisplay;
 
 pub use autoderef::autoderef;
 pub use infer::{InferTy, InferenceResult};
-pub use lower::CallableDef;
+pub use lower::CallableDefId;
 pub use lower::{
     associated_type_shorthand_candidates, callable_item_sig, ImplTraitLoweringMode, TyDefId,
     TyLoweringContext, ValueTyDefId,
@@ -87,10 +66,10 @@ pub enum TypeCtor {
     Char,
 
     /// A primitive integer type. For example, `i32`.
-    Int(Uncertain<IntTy>),
+    Int(IntTy),
 
     /// A primitive floating-point type. For example, `f64`.
-    Float(Uncertain<FloatTy>),
+    Float(FloatTy),
 
     /// Structures, enumerations and unions.
     Adt(AdtId),
@@ -123,7 +102,7 @@ pub enum TypeCtor {
     /// fn foo() -> i32 { 1 }
     /// let bar = foo; // bar: fn() -> i32 {foo}
     /// ```
-    FnDef(CallableDef),
+    FnDef(CallableDefId),
 
     /// A pointer to a function.  Written as `fn() -> i32`.
     ///
@@ -133,7 +112,8 @@ pub enum TypeCtor {
     /// fn foo() -> i32 { 1 }
     /// let bar: fn() -> i32 = foo;
     /// ```
-    FnPtr { num_args: u16 },
+    // FIXME make this a Ty variant like in Chalk
+    FnPtr { num_args: u16, is_varargs: bool },
 
     /// The never type `!`.
     Never,
@@ -147,25 +127,18 @@ pub enum TypeCtor {
     /// an **application type** like `(Iterator::Item)<T>`.
     AssociatedType(TypeAliasId),
 
+    /// This represents a placeholder for an opaque type in situations where we
+    /// don't know the hidden type (i.e. currently almost always). This is
+    /// analogous to the `AssociatedType` type constructor. As with that one,
+    /// these are only produced by Chalk.
+    OpaqueType(OpaqueTyId),
+
     /// The type of a specific closure.
     ///
     /// The closure signature is stored in a `FnPtr` type in the first type
     /// parameter.
     Closure { def: DefWithBodyId, expr: ExprId },
 }
-
-/// This exists just for Chalk, because Chalk just has a single `StructId` where
-/// we have different kinds of ADTs, primitive types and special type
-/// constructors like tuples and function pointers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
-pub struct TypeCtorId(salsa::InternId);
-impl_intern_key!(TypeCtorId);
-
-/// This exists just for Chalk, because Chalk just has a single `FnDefId` where
-/// we have different IDs for struct and enum variant constructors.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
-pub struct CallableDefId(salsa::InternId);
-impl_intern_key!(CallableDefId);
 
 impl TypeCtor {
     pub fn num_ty_params(self, db: &dyn HirDatabase) -> usize {
@@ -194,7 +167,15 @@ impl TypeCtor {
                 let generic_params = generics(db.upcast(), type_alias.into());
                 generic_params.len()
             }
-            TypeCtor::FnPtr { num_args } => num_args as usize + 1,
+            TypeCtor::OpaqueType(opaque_ty_id) => {
+                match opaque_ty_id {
+                    OpaqueTyId::ReturnTypeImplTrait(func, _) => {
+                        let generic_params = generics(db.upcast(), func.into());
+                        generic_params.len()
+                    }
+                }
+            }
+            TypeCtor::FnPtr { num_args, is_varargs: _ } => num_args as usize + 1,
             TypeCtor::Tuple { cardinality } => cardinality as usize,
         }
     }
@@ -220,6 +201,11 @@ impl TypeCtor {
             TypeCtor::AssociatedType(type_alias) => {
                 Some(type_alias.lookup(db.upcast()).module(db.upcast()).krate)
             }
+            TypeCtor::OpaqueType(opaque_ty_id) => match opaque_ty_id {
+                OpaqueTyId::ReturnTypeImplTrait(func, _) => {
+                    Some(func.lookup(db.upcast()).module(db.upcast()).krate)
+                }
+            },
         }
     }
 
@@ -241,6 +227,7 @@ impl TypeCtor {
             TypeCtor::Adt(adt) => Some(adt.into()),
             TypeCtor::FnDef(callable) => Some(callable.into()),
             TypeCtor::AssociatedType(type_alias) => Some(type_alias.into()),
+            TypeCtor::OpaqueType(_impl_trait_id) => None,
         }
     }
 }
@@ -251,6 +238,12 @@ impl TypeCtor {
 #[derive(Clone, PartialEq, Eq, Debug, Hash)]
 pub struct ApplicationTy {
     pub ctor: TypeCtor,
+    pub parameters: Substs,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug, Hash)]
+pub struct OpaqueTy {
+    pub opaque_ty_id: OpaqueTyId,
     pub parameters: Substs,
 }
 
@@ -308,6 +301,12 @@ pub enum Ty {
     /// trait and all its parameters are fully known.
     Projection(ProjectionTy),
 
+    /// An opaque type (`impl Trait`).
+    ///
+    /// This is currently only used for return type impl trait; each instance of
+    /// `impl Trait` in a return type gets its own ID.
+    Opaque(OpaqueTy),
+
     /// A placeholder for a type parameter; for example, `T` in `fn f<T>(x: T)
     /// {}` when we're type-checking the body of that function. In this
     /// situation, we know this stands for *some* type, but don't know the exact
@@ -331,12 +330,6 @@ pub enum Ty {
     /// implicit; Chalk has the `Binders` struct to make it explicit, but it
     /// didn't seem worth the overhead yet.
     Dyn(Arc<[GenericPredicate]>),
-
-    /// An opaque type (`impl Trait`).
-    ///
-    /// The predicates are quantified over the `Self` type; see `Ty::Dyn` for
-    /// more.
-    Opaque(Arc<[GenericPredicate]>),
 
     /// A placeholder for a type which could not be computed; this is propagated
     /// to avoid useless error messages. Doubles as a placeholder where type
@@ -490,7 +483,7 @@ impl Deref for Substs {
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
 pub struct Binders<T> {
     pub num_binders: usize,
     pub value: T,
@@ -531,6 +524,20 @@ impl<T: TypeWalk> Binders<T> {
     pub fn subst_prefix(self, subst: &Substs) -> Binders<T> {
         assert!(subst.len() < self.num_binders);
         Binders::new(self.num_binders - subst.len(), self.value.subst_bound_vars(subst))
+    }
+}
+
+impl<T: TypeWalk> TypeWalk for Binders<T> {
+    fn walk(&self, f: &mut impl FnMut(&Ty)) {
+        self.value.walk(f);
+    }
+
+    fn walk_mut_binders(
+        &mut self,
+        f: &mut impl FnMut(&mut Ty, DebruijnIndex),
+        binders: DebruijnIndex,
+    ) {
+        self.value.walk_mut_binders(f, binders.shifted_in())
     }
 }
 
@@ -578,17 +585,11 @@ pub enum GenericPredicate {
 
 impl GenericPredicate {
     pub fn is_error(&self) -> bool {
-        match self {
-            GenericPredicate::Error => true,
-            _ => false,
-        }
+        matches!(self, GenericPredicate::Error)
     }
 
     pub fn is_implemented(&self) -> bool {
-        match self {
-            GenericPredicate::Implemented(_) => true,
-            _ => false,
-        }
+        matches!(self, GenericPredicate::Implemented(_))
     }
 
     pub fn trait_ref(&self, db: &dyn HirDatabase) -> Option<TraitRef> {
@@ -626,13 +627,27 @@ impl TypeWalk for GenericPredicate {
 
 /// Basically a claim (currently not validated / checked) that the contained
 /// type / trait ref contains no inference variables; any inference variables it
-/// contained have been replaced by bound variables, and `num_vars` tells us how
-/// many there are. This is used to erase irrelevant differences between types
-/// before using them in queries.
+/// contained have been replaced by bound variables, and `kinds` tells us how
+/// many there are and whether they were normal or float/int variables. This is
+/// used to erase irrelevant differences between types before using them in
+/// queries.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Canonical<T> {
     pub value: T,
-    pub num_vars: usize,
+    pub kinds: Arc<[TyKind]>,
+}
+
+impl<T> Canonical<T> {
+    pub fn new(value: T, kinds: impl IntoIterator<Item = TyKind>) -> Self {
+        Self { value, kinds: kinds.into_iter().collect() }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum TyKind {
+    General,
+    Integer,
+    Float,
 }
 
 /// A function signature as seen by type inference: Several parameter types and
@@ -640,19 +655,20 @@ pub struct Canonical<T> {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct FnSig {
     params_and_return: Arc<[Ty]>,
+    is_varargs: bool,
 }
 
 /// A polymorphic function signature.
 pub type PolyFnSig = Binders<FnSig>;
 
 impl FnSig {
-    pub fn from_params_and_return(mut params: Vec<Ty>, ret: Ty) -> FnSig {
+    pub fn from_params_and_return(mut params: Vec<Ty>, ret: Ty, is_varargs: bool) -> FnSig {
         params.push(ret);
-        FnSig { params_and_return: params.into() }
+        FnSig { params_and_return: params.into(), is_varargs }
     }
 
-    pub fn from_fn_ptr_substs(substs: &Substs) -> FnSig {
-        FnSig { params_and_return: Arc::clone(&substs.0) }
+    pub fn from_fn_ptr_substs(substs: &Substs, is_varargs: bool) -> FnSig {
+        FnSig { params_and_return: Arc::clone(&substs.0), is_varargs }
     }
 
     pub fn params(&self) -> &[Ty] {
@@ -697,7 +713,7 @@ impl Ty {
     }
     pub fn fn_ptr(sig: FnSig) -> Self {
         Ty::apply(
-            TypeCtor::FnPtr { num_args: sig.params().len() as u16 },
+            TypeCtor::FnPtr { num_args: sig.params().len() as u16, is_varargs: sig.is_varargs },
             Substs(sig.params_and_return),
         )
     }
@@ -751,15 +767,6 @@ impl Ty {
         }
     }
 
-    pub fn as_callable(&self) -> Option<(CallableDef, &Substs)> {
-        match self {
-            Ty::Apply(ApplicationTy { ctor: TypeCtor::FnDef(callable_def), parameters }) => {
-                Some((*callable_def, parameters))
-            }
-            _ => None,
-        }
-    }
-
     pub fn is_never(&self) -> bool {
         matches!(self, Ty::Apply(ApplicationTy { ctor: TypeCtor::Never, .. }))
     }
@@ -775,6 +782,11 @@ impl Ty {
         }
     }
 
+    /// If this is a `dyn Trait`, returns that trait.
+    pub fn dyn_trait(&self) -> Option<TraitId> {
+        self.dyn_trait_ref().map(|it| it.trait_)
+    }
+
     fn builtin_deref(&self) -> Option<Ty> {
         match self {
             Ty::Apply(a_ty) => match a_ty.ctor {
@@ -786,10 +798,12 @@ impl Ty {
         }
     }
 
-    fn callable_sig(&self, db: &dyn HirDatabase) -> Option<FnSig> {
+    pub fn callable_sig(&self, db: &dyn HirDatabase) -> Option<FnSig> {
         match self {
             Ty::Apply(a_ty) => match a_ty.ctor {
-                TypeCtor::FnPtr { .. } => Some(FnSig::from_fn_ptr_substs(&a_ty.parameters)),
+                TypeCtor::FnPtr { is_varargs, .. } => {
+                    Some(FnSig::from_fn_ptr_substs(&a_ty.parameters, is_varargs))
+                }
                 TypeCtor::FnDef(def) => {
                     let sig = db.callable_item_signature(def);
                     Some(sig.subst(&a_ty.parameters))
@@ -827,13 +841,56 @@ impl Ty {
         }
     }
 
-    /// If this is a `dyn Trait`, returns that trait.
-    pub fn dyn_trait(&self) -> Option<TraitId> {
+    pub fn impl_trait_bounds(&self, db: &dyn HirDatabase) -> Option<Vec<GenericPredicate>> {
         match self {
-            Ty::Dyn(predicates) => predicates.iter().find_map(|pred| match pred {
-                GenericPredicate::Implemented(tr) => Some(tr.trait_),
-                _ => None,
-            }),
+            Ty::Opaque(opaque_ty) => {
+                let predicates = match opaque_ty.opaque_ty_id {
+                    OpaqueTyId::ReturnTypeImplTrait(func, idx) => {
+                        db.return_type_impl_traits(func).map(|it| {
+                            let data = (*it)
+                                .as_ref()
+                                .map(|rpit| rpit.impl_traits[idx as usize].bounds.clone());
+                            data.subst(&opaque_ty.parameters)
+                        })
+                    }
+                };
+
+                predicates.map(|it| it.value)
+            }
+            Ty::Placeholder(id) => {
+                let generic_params = db.generic_params(id.parent);
+                let param_data = &generic_params.types[id.local_id];
+                match param_data.provenance {
+                    hir_def::generics::TypeParamProvenance::ArgumentImplTrait => {
+                        let predicates = db
+                            .generic_predicates_for_param(*id)
+                            .into_iter()
+                            .map(|pred| pred.value.clone())
+                            .collect_vec();
+
+                        Some(predicates)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    pub fn associated_type_parent_trait(&self, db: &dyn HirDatabase) -> Option<TraitId> {
+        match self {
+            Ty::Apply(ApplicationTy { ctor: TypeCtor::AssociatedType(type_alias_id), .. }) => {
+                match type_alias_id.lookup(db.upcast()).container {
+                    AssocContainerId::TraitId(trait_id) => Some(trait_id),
+                    _ => None,
+                }
+            }
+            Ty::Projection(projection_ty) => {
+                match projection_ty.associated_ty.lookup(db.upcast()).container {
+                    AssocContainerId::TraitId(trait_id) => Some(trait_id),
+                    _ => None,
+                }
+            }
             _ => None,
         }
     }
@@ -947,9 +1004,14 @@ impl TypeWalk for Ty {
                     t.walk(f);
                 }
             }
-            Ty::Dyn(predicates) | Ty::Opaque(predicates) => {
+            Ty::Dyn(predicates) => {
                 for p in predicates.iter() {
                     p.walk(f);
+                }
+            }
+            Ty::Opaque(o_ty) => {
+                for t in o_ty.parameters.iter() {
+                    t.walk(f);
                 }
             }
             Ty::Placeholder { .. } | Ty::Bound(_) | Ty::Infer(_) | Ty::Unknown => {}
@@ -969,13 +1031,48 @@ impl TypeWalk for Ty {
             Ty::Projection(p_ty) => {
                 p_ty.parameters.walk_mut_binders(f, binders);
             }
-            Ty::Dyn(predicates) | Ty::Opaque(predicates) => {
+            Ty::Dyn(predicates) => {
                 for p in make_mut_slice(predicates) {
                     p.walk_mut_binders(f, binders.shifted_in());
                 }
+            }
+            Ty::Opaque(o_ty) => {
+                o_ty.parameters.walk_mut_binders(f, binders);
             }
             Ty::Placeholder { .. } | Ty::Bound(_) | Ty::Infer(_) | Ty::Unknown => {}
         }
         f(self, binders);
     }
+}
+
+impl<T: TypeWalk> TypeWalk for Vec<T> {
+    fn walk(&self, f: &mut impl FnMut(&Ty)) {
+        for t in self {
+            t.walk(f);
+        }
+    }
+    fn walk_mut_binders(
+        &mut self,
+        f: &mut impl FnMut(&mut Ty, DebruijnIndex),
+        binders: DebruijnIndex,
+    ) {
+        for t in self {
+            t.walk_mut_binders(f, binders);
+        }
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
+pub enum OpaqueTyId {
+    ReturnTypeImplTrait(hir_def::FunctionId, u16),
+}
+
+#[derive(Clone, PartialEq, Eq, Debug, Hash)]
+pub struct ReturnTypeImplTraits {
+    pub(crate) impl_traits: Vec<ReturnTypeImplTrait>,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug, Hash)]
+pub(crate) struct ReturnTypeImplTrait {
+    pub bounds: Binders<Vec<GenericPredicate>>,
 }

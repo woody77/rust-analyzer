@@ -55,6 +55,38 @@ export function analyzerStatus(ctx: Ctx): Cmd {
     };
 }
 
+export function memoryUsage(ctx: Ctx): Cmd {
+    const tdcp = new class implements vscode.TextDocumentContentProvider {
+        readonly uri = vscode.Uri.parse('rust-analyzer-memory://memory');
+        readonly eventEmitter = new vscode.EventEmitter<vscode.Uri>();
+
+        provideTextDocumentContent(_uri: vscode.Uri): vscode.ProviderResult<string> {
+            if (!vscode.window.activeTextEditor) return '';
+
+            return ctx.client.sendRequest(ra.memoryUsage, null).then((mem) => {
+                return 'Per-query memory usage:\n' + mem + '\n(note: database has been cleared)';
+            });
+        }
+
+        get onDidChange(): vscode.Event<vscode.Uri> {
+            return this.eventEmitter.event;
+        }
+    }();
+
+    ctx.pushCleanup(
+        vscode.workspace.registerTextDocumentContentProvider(
+            'rust-analyzer-memory',
+            tdcp,
+        ),
+    );
+
+    return async () => {
+        tdcp.eventEmitter.fire(tdcp.uri);
+        const document = await vscode.workspace.openTextDocument(tdcp.uri);
+        return vscode.window.showTextDocument(document, vscode.ViewColumn.Two, true);
+    };
+}
+
 export function matchingBrace(ctx: Ctx): Cmd {
     return async () => {
         const editor = ctx.activeRustEditor;
@@ -158,7 +190,7 @@ export function ssr(ctx: Ctx): Cmd {
 
         const options: vscode.InputBoxOptions = {
             value: "() ==>> ()",
-            prompt: "Enter request, for example 'Foo($a:expr) ==> Foo::new($a)' ",
+            prompt: "Enter request, for example 'Foo($a) ==> Foo::new($a)' ",
             validateInput: async (x: string) => {
                 try {
                     await client.sendRequest(ra.ssr, { query: x, parseOnly: true });
@@ -171,9 +203,15 @@ export function ssr(ctx: Ctx): Cmd {
         const request = await vscode.window.showInputBox(options);
         if (!request) return;
 
-        const edit = await client.sendRequest(ra.ssr, { query: request, parseOnly: false });
+        vscode.window.withProgress({
+            location: vscode.ProgressLocation.Notification,
+            title: "Structured search replace in progress...",
+            cancellable: false,
+        }, async (_progress, _token) => {
+            const edit = await client.sendRequest(ra.ssr, { query: request, parseOnly: false });
 
-        await vscode.workspace.applyEdit(client.protocol2CodeConverter.asWorkspaceEdit(edit));
+            await vscode.workspace.applyEdit(client.protocol2CodeConverter.asWorkspaceEdit(edit));
+        });
     };
 }
 
@@ -324,8 +362,8 @@ export function expandMacro(ctx: Ctx): Cmd {
     };
 }
 
-export function collectGarbage(ctx: Ctx): Cmd {
-    return async () => ctx.client.sendRequest(ra.collectGarbage, null);
+export function reloadWorkspace(ctx: Ctx): Cmd {
+    return async () => ctx.client.sendRequest(ra.reloadWorkspace, null);
 }
 
 export function showReferences(ctx: Ctx): Cmd {
@@ -343,10 +381,39 @@ export function showReferences(ctx: Ctx): Cmd {
 }
 
 export function applyActionGroup(_ctx: Ctx): Cmd {
-    return async (actions: { label: string; edit: vscode.WorkspaceEdit }[]) => {
+    return async (actions: { label: string; arguments: ra.ResolveCodeActionParams }[]) => {
         const selectedAction = await vscode.window.showQuickPick(actions);
         if (!selectedAction) return;
-        await applySnippetWorkspaceEdit(selectedAction.edit);
+        vscode.commands.executeCommand(
+            'rust-analyzer.resolveCodeAction',
+            selectedAction.arguments,
+        );
+    };
+}
+
+export function gotoLocation(ctx: Ctx): Cmd {
+    return async (locationLink: lc.LocationLink) => {
+        const client = ctx.client;
+        if (client) {
+            const uri = client.protocol2CodeConverter.asUri(locationLink.targetUri);
+            let range = client.protocol2CodeConverter.asRange(locationLink.targetSelectionRange);
+            // collapse the range to a cursor position
+            range = range.with({ end: range.start });
+
+            await vscode.window.showTextDocument(uri, { selection: range });
+        }
+    };
+}
+
+export function resolveCodeAction(ctx: Ctx): Cmd {
+    const client = ctx.client;
+    return async (params: ra.ResolveCodeActionParams) => {
+        const item: lc.WorkspaceEdit = await client.sendRequest(ra.resolveCodeAction, params);
+        if (!item) {
+            return;
+        }
+        const edit = client.protocol2CodeConverter.asWorkspaceEdit(item);
+        await applySnippetWorkspaceEdit(edit);
     };
 }
 
@@ -365,7 +432,7 @@ export function run(ctx: Ctx): Cmd {
 
         item.detail = 'rerun';
         prevRunnable = item;
-        const task = createTask(item.runnable);
+        const task = await createTask(item.runnable, ctx.config);
         return await vscode.tasks.executeTask(task);
     };
 }
@@ -375,7 +442,7 @@ export function runSingle(ctx: Ctx): Cmd {
         const editor = ctx.activeRustEditor;
         if (!editor) return;
 
-        const task = createTask(runnable);
+        const task = await createTask(runnable, ctx.config);
         task.group = vscode.TaskGroup.Build;
         task.presentationOptions = {
             reveal: vscode.TaskRevealKind.Always,

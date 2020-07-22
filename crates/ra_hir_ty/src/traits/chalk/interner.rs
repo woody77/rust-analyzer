@@ -22,6 +22,8 @@ pub type AssociatedTyValueId = chalk_solve::rust_ir::AssociatedTyValueId<Interne
 pub type AssociatedTyValue = chalk_solve::rust_ir::AssociatedTyValue<Interner>;
 pub type FnDefId = chalk_ir::FnDefId<Interner>;
 pub type FnDefDatum = chalk_solve::rust_ir::FnDefDatum<Interner>;
+pub type OpaqueTyId = chalk_ir::OpaqueTyId<Interner>;
+pub type OpaqueTyDatum = chalk_solve::rust_ir::OpaqueTyDatum<Interner>;
 
 impl chalk_ir::interner::Interner for Interner {
     type InternedType = Box<chalk_ir::TyData<Self>>; // FIXME use Arc?
@@ -37,9 +39,11 @@ impl chalk_ir::interner::Interner for Interner {
     type InternedQuantifiedWhereClauses = Vec<chalk_ir::QuantifiedWhereClause<Self>>;
     type InternedVariableKinds = Vec<chalk_ir::VariableKind<Self>>;
     type InternedCanonicalVarKinds = Vec<chalk_ir::CanonicalVarKind<Self>>;
+    type InternedConstraints = Vec<chalk_ir::InEnvironment<chalk_ir::Constraint<Self>>>;
     type DefId = InternId;
-    type InternedAdtId = crate::TypeCtorId;
+    type InternedAdtId = hir_def::AdtId;
     type Identifier = TypeAliasId;
+    type FnAbi = ();
 
     fn debug_adt_id(type_kind_id: AdtId, fmt: &mut fmt::Formatter<'_>) -> Option<fmt::Result> {
         tls::with_current_program(|prog| Some(prog?.debug_struct_id(type_kind_id, fmt)))
@@ -345,6 +349,32 @@ impl chalk_ir::interner::Interner for Interner {
         canonical_var_kinds: &'a Self::InternedCanonicalVarKinds,
     ) -> &'a [chalk_ir::CanonicalVarKind<Self>] {
         &canonical_var_kinds
+    }
+
+    fn intern_constraints<E>(
+        &self,
+        data: impl IntoIterator<Item = Result<chalk_ir::InEnvironment<chalk_ir::Constraint<Self>>, E>>,
+    ) -> Result<Self::InternedConstraints, E> {
+        data.into_iter().collect()
+    }
+
+    fn constraints_data<'a>(
+        &self,
+        constraints: &'a Self::InternedConstraints,
+    ) -> &'a [chalk_ir::InEnvironment<chalk_ir::Constraint<Self>>] {
+        constraints
+    }
+    fn debug_closure_id(
+        _fn_def_id: chalk_ir::ClosureId<Self>,
+        _fmt: &mut fmt::Formatter<'_>,
+    ) -> Option<fmt::Result> {
+        None
+    }
+    fn debug_constraints(
+        _clauses: &chalk_ir::Constraints<Self>,
+        _fmt: &mut fmt::Formatter<'_>,
+    ) -> Option<fmt::Result> {
+        None
     }
 }
 

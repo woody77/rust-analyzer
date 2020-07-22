@@ -19,7 +19,7 @@ pub(crate) fn highlight_as_html(db: &RootDatabase, file_id: FileId, rainbow: boo
         )
     }
 
-    let ranges = highlight(db, file_id, None);
+    let ranges = highlight(db, file_id, None, false);
     let text = parse.tree().syntax().to_string();
     let mut prev_pos = TextSize::from(0);
     let mut buf = String::new();
@@ -64,12 +64,15 @@ pre                 { color: #DCDCCC; background: #3F3F3F; font-size: 22px; padd
 
 .lifetime           { color: #DFAF8F; font-style: italic; }
 .comment            { color: #7F9F7F; }
+.documentation      { color: #629755; }
+.injected           { opacity: 0.65 ; }
 .struct, .enum      { color: #7CB8BB; }
 .enum_variant       { color: #BDE0F3; }
 .string_literal     { color: #CC9393; }
 .field              { color: #94BFF3; }
 .function           { color: #93E0E3; }
-.operator.unsafe    { color: #E28C14; }
+.function.unsafe    { color: #BC8383; }
+.operator.unsafe    { color: #BC8383; }
 .parameter          { color: #94BFF3; }
 .text               { color: #DCDCCC; }
 .type               { color: #7CB8BB; }
@@ -80,12 +83,15 @@ pre                 { color: #DCDCCC; background: #3F3F3F; font-size: 22px; padd
 .bool_literal       { color: #BFE6EB; }
 .macro              { color: #94BFF3; }
 .module             { color: #AFD8AF; }
+.value_param        { color: #DCDCCC; }
 .variable           { color: #DCDCCC; }
 .format_specifier   { color: #CC696B; }
 .mutable            { text-decoration: underline; }
-
+.escape_sequence    { color: #94BFF3; }
 .keyword            { color: #F0DFAF; font-weight: bold; }
 .keyword.unsafe     { color: #BC8383; font-weight: bold; }
 .control            { font-style: italic; }
+
+.unresolved_reference { color: #FC5555; text-decoration: wavy underline; }
 </style>
 ";

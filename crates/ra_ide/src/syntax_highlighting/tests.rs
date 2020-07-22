@@ -1,15 +1,13 @@
 use std::fs;
 
-use test_utils::{assert_eq_text, project_dir, read_text};
+use expect::{expect_file, ExpectFile};
+use test_utils::project_dir;
 
-use crate::{
-    mock_analysis::{single_file, MockAnalysis},
-    FileRange, TextRange,
-};
+use crate::{mock_analysis::single_file, FileRange, TextRange};
 
 #[test]
 fn test_highlighting() {
-    let (analysis, file_id) = single_file(
+    check_highlighting(
         r#"
 #[derive(Clone, Debug)]
 struct Foo {
@@ -27,6 +25,16 @@ impl Bar for Foo {
     }
 }
 
+impl Foo {
+    fn baz(mut self) -> i32 {
+        self.x
+    }
+
+    fn qux(&mut self) {
+        self.x = 0;
+    }
+}
+
 static mut STATIC_MUT: i32 = 0;
 
 fn foo<'a, T>() -> T {
@@ -40,6 +48,12 @@ macro_rules! def_fn {
 def_fn! {
     fn bar() -> u32 {
         100
+    }
+}
+
+macro_rules! noop {
+    ($expr:expr) => {
+        $expr
     }
 }
 
@@ -61,9 +75,13 @@ fn main() {
         // Do nothing
     }
 
+    noop!(noop!(1));
+
     let mut x = 42;
     let y = &mut x;
     let z = &y;
+
+    let Foo { x: z, y } = Foo { x: z, y };
 
     y;
 }
@@ -84,17 +102,14 @@ impl<T> Option<T> {
 }
 "#
         .trim(),
+        expect_file!["crates/ra_ide/test_data/highlighting.html"],
+        false,
     );
-    let dst_file = project_dir().join("crates/ra_ide/src/snapshots/highlighting.html");
-    let actual_html = &analysis.highlight_as_html(file_id, false).unwrap();
-    let expected_html = &read_text(&dst_file);
-    fs::write(dst_file, &actual_html).unwrap();
-    assert_eq_text!(expected_html, actual_html);
 }
 
 #[test]
 fn test_rainbow_highlighting() {
-    let (analysis, file_id) = single_file(
+    check_highlighting(
         r#"
 fn main() {
     let hello = "hello";
@@ -110,12 +125,9 @@ fn bar() {
 }
 "#
         .trim(),
+        expect_file!["crates/ra_ide/test_data/rainbow_highlighting.html"],
+        true,
     );
-    let dst_file = project_dir().join("crates/ra_ide/src/snapshots/rainbow_highlighting.html");
-    let actual_html = &analysis.highlight_as_html(file_id, true).unwrap();
-    let expected_html = &read_text(&dst_file);
-    fs::write(dst_file, &actual_html).unwrap();
-    assert_eq_text!(expected_html, actual_html);
 }
 
 #[test]
@@ -123,12 +135,10 @@ fn accidentally_quadratic() {
     let file = project_dir().join("crates/ra_syntax/test_data/accidentally_quadratic");
     let src = fs::read_to_string(file).unwrap();
 
-    let mut mock = MockAnalysis::new();
-    let file_id = mock.add_file("/main.rs", &src);
-    let host = mock.analysis_host();
+    let (analysis, file_id) = single_file(&src);
 
     // let t = std::time::Instant::now();
-    let _ = host.analysis().highlight(file_id).unwrap();
+    let _ = analysis.highlight(file_id).unwrap();
     // eprintln!("elapsed: {:?}", t.elapsed());
 }
 
@@ -136,16 +146,17 @@ fn accidentally_quadratic() {
 fn test_ranges() {
     let (analysis, file_id) = single_file(
         r#"
-            #[derive(Clone, Debug)]
-            struct Foo {
-                pub x: i32,
-                pub y: i32,
-            }"#,
+#[derive(Clone, Debug)]
+struct Foo {
+    pub x: i32,
+    pub y: i32,
+}
+"#,
     );
 
     // The "x"
     let highlights = &analysis
-        .highlight_range(FileRange { file_id, range: TextRange::at(82.into(), 1.into()) })
+        .highlight_range(FileRange { file_id, range: TextRange::at(45.into(), 1.into()) })
         .unwrap();
 
     assert_eq!(&highlights[0].highlight.to_string(), "field.declaration");
@@ -153,7 +164,7 @@ fn test_ranges() {
 
 #[test]
 fn test_flattening() {
-    let (analysis, file_id) = single_file(
+    check_highlighting(
         r##"
 fn fixture(ra_fixture: &str) {}
 
@@ -167,13 +178,9 @@ fn main() {
     );
 }"##
         .trim(),
+        expect_file!["crates/ra_ide/test_data/highlight_injection.html"],
+        false,
     );
-
-    let dst_file = project_dir().join("crates/ra_ide/src/snapshots/highlight_injection.html");
-    let actual_html = &analysis.highlight_as_html(file_id, false).unwrap();
-    let expected_html = &read_text(&dst_file);
-    fs::write(dst_file, &actual_html).unwrap();
-    assert_eq_text!(expected_html, actual_html);
 }
 
 #[test]
@@ -192,7 +199,7 @@ macro_rules! test {}
 fn test_string_highlighting() {
     // The format string detection is based on macro-expansion,
     // thus, we have to copy the macro definition from `std`
-    let (analysis, file_id) = single_file(
+    check_highlighting(
         r#"
 macro_rules! println {
     ($($arg:tt)*) => ({
@@ -246,22 +253,22 @@ fn main() {
 
     println!(r"Hello, {}!", "world");
 
+    // escape sequences
+    println!("Hello\nWorld");
+    println!("\u{48}\x65\x6C\x6C\x6F World");
+
     println!("{\x41}", A = 92);
     println!("{ничоси}", ничоси = 92);
 }"#
         .trim(),
+        expect_file!["crates/ra_ide/test_data/highlight_strings.html"],
+        false,
     );
-
-    let dst_file = project_dir().join("crates/ra_ide/src/snapshots/highlight_strings.html");
-    let actual_html = &analysis.highlight_as_html(file_id, false).unwrap();
-    let expected_html = &read_text(&dst_file);
-    fs::write(dst_file, &actual_html).unwrap();
-    assert_eq_text!(expected_html, actual_html);
 }
 
 #[test]
 fn test_unsafe_highlighting() {
-    let (analysis, file_id) = single_file(
+    check_highlighting(
         r#"
 unsafe fn unsafe_fn() {}
 
@@ -276,16 +283,98 @@ fn main() {
     unsafe {
         unsafe_fn();
         HasUnsafeFn.unsafe_method();
-        let y = *x;
+        let y = *(x);
         let z = -x;
     }
 }
 "#
         .trim(),
+        expect_file!["crates/ra_ide/test_data/highlight_unsafe.html"],
+        false,
     );
-    let dst_file = project_dir().join("crates/ra_ide/src/snapshots/highlight_unsafe.html");
-    let actual_html = &analysis.highlight_as_html(file_id, false).unwrap();
-    let expected_html = &read_text(&dst_file);
-    fs::write(dst_file, &actual_html).unwrap();
-    assert_eq_text!(expected_html, actual_html);
+}
+
+#[test]
+fn test_highlight_doctest() {
+    check_highlighting(
+        r#"
+/// ```
+/// let _ = "early doctests should not go boom";
+/// ```
+struct Foo {
+    bar: bool,
+}
+
+impl Foo {
+    pub const bar: bool = true;
+
+    /// Constructs a new `Foo`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #![allow(unused_mut)]
+    /// let mut foo: Foo = Foo::new();
+    /// ```
+    pub const fn new() -> Foo {
+        Foo { bar: true }
+    }
+
+    /// `bar` method on `Foo`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use x::y;
+    ///
+    /// let foo = Foo::new();
+    ///
+    /// // calls bar on foo
+    /// assert!(foo.bar());
+    ///
+    /// let bar = foo.bar || Foo::bar;
+    ///
+    /// /* multi-line
+    ///        comment */
+    ///
+    /// let multi_line_string = "Foo
+    ///   bar
+    ///          ";
+    ///
+    /// ```
+    ///
+    /// ```rust,no_run
+    /// let foobar = Foo::new().bar();
+    /// ```
+    ///
+    /// ```sh
+    /// echo 1
+    /// ```
+    pub fn foo(&self) -> bool {
+        true
+    }
+}
+
+/// ```
+/// noop!(1);
+/// ```
+macro_rules! noop {
+    ($expr:expr) => {
+        $expr
+    }
+}
+"#
+        .trim(),
+        expect_file!["crates/ra_ide/test_data/highlight_doctest.html"],
+        false,
+    );
+}
+
+/// Highlights the code given by the `ra_fixture` argument, renders the
+/// result as HTML, and compares it with the HTML file given as `snapshot`.
+/// Note that the `snapshot` file is overwritten by the rendered HTML.
+fn check_highlighting(ra_fixture: &str, expect: ExpectFile, rainbow: bool) {
+    let (analysis, file_id) = single_file(ra_fixture);
+    let actual_html = &analysis.highlight_as_html(file_id, rainbow).unwrap();
+    expect.assert_eq(actual_html)
 }

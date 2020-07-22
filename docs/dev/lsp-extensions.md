@@ -97,6 +97,30 @@ Invoking code action at this position will yield two code actions for importing 
 * Is a fixed two-level structure enough?
 * Should we devise a general way to encode custom interaction protocols for GUI refactorings?
 
+## Lazy assists with `ResolveCodeAction`
+
+**Issue:** https://github.com/microsoft/language-server-protocol/issues/787
+
+**Client Capability** `{ "resolveCodeAction": boolean }`
+
+If this capability is set, the assists will be computed lazily. Thus `CodeAction` returned from the server will only contain `id` but not `edit` or `command` fields. The only exclusion from the rule is the diagnostic edits.
+
+After the client got the id, it should then call `experimental/resolveCodeAction` command on the server and provide the following payload:
+
+```typescript
+interface ResolveCodeActionParams {
+    id: string;
+    codeActionParams: lc.CodeActionParams;
+}
+```
+
+As a result of the command call the client will get the respective workspace edit (`lc.WorkspaceEdit`).
+
+### Unresolved Questions
+
+* Apply smarter filtering for ids?
+* Upon `resolveCodeAction` command only call the assits which should be resolved and not all of them?
+
 ## Parent Module
 
 **Issue:** https://github.com/microsoft/language-server-protocol/issues/1002
@@ -365,15 +389,27 @@ rust-analyzer supports only one `kind`, `"cargo"`. The `args` for `"cargo"` look
 
 Returns internal status message, mostly for debugging purposes.
 
-## Collect Garbage
+## Reload Workspace
 
-**Method:** `rust-analyzer/collectGarbage`
+**Method:** `rust-analyzer/reloadWorkspace`
 
 **Request:** `null`
 
 **Response:** `null`
 
-Frees some caches. For internal use, and is mostly broken at the moment.
+Reloads project information (that is, re-executes `cargo metadata`).
+
+## Status Notification
+
+**Client Capability:** `{ "statusNotification": boolean }`
+
+**Method:** `rust-analyzer/status`
+
+**Notification:** `"loading" | "ready" | "invalid" | "needsReload"`
+
+This notification is sent from server to client.
+The client can use it to display persistent status to the user (in modline).
+For `needsReload` state, the client can provide a context-menu action to run `rust-analyzer/reloadWorkspace` request.
 
 ## Syntax Tree
 
@@ -442,4 +478,42 @@ interface InlayHint {
     range: Range,
     label: string,
 }
+```
+
+## Hover Actions
+
+**Client Capability:** `{ "hoverActions": boolean }`
+
+If this capability is set, `Hover` request returned from the server might contain an additional field, `actions`:
+
+```typescript
+interface Hover {
+    ...
+    actions?: CommandLinkGroup[];
+}
+
+interface CommandLink extends Command {
+    /**
+     * A tooltip for the command, when represented in the UI.
+     */
+    tooltip?: string;
+}
+
+interface CommandLinkGroup {
+    title?: string;
+    commands: CommandLink[];
+}
+```
+
+Such actions on the client side are appended to a hover bottom as command links:
+```
+  +-----------------------------+
+  | Hover content               |
+  |                             |
+  +-----------------------------+
+  | _Action1_ | _Action2_       |  <- first group, no TITLE
+  +-----------------------------+
+  | TITLE _Action1_ | _Action2_ |  <- second group
+  +-----------------------------+
+  ...
 ```

@@ -10,6 +10,7 @@ mod display_source_code;
 
 use std::sync::Arc;
 
+use expect::Expect;
 use hir_def::{
     body::{BodySourceMap, SyntheticSyntax},
     child_by_source::ChildBySource,
@@ -17,11 +18,10 @@ use hir_def::{
     item_scope::ItemScope,
     keys,
     nameres::CrateDefMap,
-    AssocItemId, DefWithBodyId, LocalModuleId, Lookup, ModuleDefId, ModuleId,
+    AssocItemId, DefWithBodyId, LocalModuleId, Lookup, ModuleDefId,
 };
 use hir_expand::{db::AstDatabase, InFile};
-use insta::assert_snapshot;
-use ra_db::{fixture::WithFixture, salsa::Database, FilePosition, SourceDatabase};
+use ra_db::{fixture::WithFixture, FileRange, SourceDatabase, SourceDatabaseExt};
 use ra_syntax::{
     algo,
     ast::{self, AstNode},
@@ -34,24 +34,53 @@ use crate::{
 };
 
 // These tests compare the inference results for all expressions in a file
-// against snapshots of the expected results using insta. Use cargo-insta to
-// update the snapshots.
+// against snapshots of the expected results using expect. Use
+// `env UPDATE_EXPECT=1 cargo test -p ra_hir_ty` to update the snapshots.
 
-fn type_at_pos(db: &TestDB, pos: FilePosition) -> String {
-    type_at_pos_displayed(db, pos, |ty, _| ty.display(db).to_string())
+fn setup_tracing() -> tracing::subscriber::DefaultGuard {
+    use tracing_subscriber::{layer::SubscriberExt, EnvFilter, Registry};
+    use tracing_tree::HierarchicalLayer;
+    let filter = EnvFilter::from_env("CHALK_DEBUG");
+    let layer = HierarchicalLayer::default()
+        .with_indent_lines(true)
+        .with_ansi(false)
+        .with_indent_amount(2)
+        .with_writer(std::io::stderr);
+    let subscriber = Registry::default().with(filter).with(layer);
+    tracing::subscriber::set_default(subscriber)
 }
 
-fn displayed_source_at_pos(db: &TestDB, pos: FilePosition) -> String {
-    type_at_pos_displayed(db, pos, |ty, module_id| ty.display_source_code(db, module_id).unwrap())
+fn check_types(ra_fixture: &str) {
+    check_types_impl(ra_fixture, false)
 }
 
-fn type_at_pos_displayed(
-    db: &TestDB,
-    pos: FilePosition,
-    display_fn: impl FnOnce(&Ty, ModuleId) -> String,
-) -> String {
+fn check_types_source_code(ra_fixture: &str) {
+    check_types_impl(ra_fixture, true)
+}
+
+fn check_types_impl(ra_fixture: &str, display_source: bool) {
+    let _tracing = setup_tracing();
+    let db = TestDB::with_files(ra_fixture);
+    let mut checked_one = false;
+    for (file_id, annotations) in db.extract_annotations() {
+        for (range, expected) in annotations {
+            let ty = type_at_range(&db, FileRange { file_id, range });
+            let actual = if display_source {
+                let module = db.module_for_file(file_id);
+                ty.display_source_code(&db, module).unwrap()
+            } else {
+                ty.display(&db).to_string()
+            };
+            assert_eq!(expected, actual);
+            checked_one = true;
+        }
+    }
+    assert!(checked_one, "no `//^` annotations found");
+}
+
+fn type_at_range(db: &TestDB, pos: FileRange) -> Ty {
     let file = db.parse(pos.file_id).ok().unwrap();
-    let expr = algo::find_node_at_offset::<ast::Expr>(file.syntax(), pos.offset).unwrap();
+    let expr = algo::find_node_at_range::<ast::Expr>(file.syntax(), pos.range).unwrap();
     let fn_def = expr.syntax().ancestors().find_map(ast::FnDef::cast).unwrap();
     let module = db.module_for_file(pos.file_id);
     let func = *module.child_by_source(db)[keys::FUNCTION]
@@ -61,15 +90,9 @@ fn type_at_pos_displayed(
     let (_body, source_map) = db.body_with_source_map(func.into());
     if let Some(expr_id) = source_map.node_expr(InFile::new(pos.file_id.into(), &expr)) {
         let infer = db.infer(func.into());
-        let ty = &infer[expr_id];
-        return display_fn(ty, module);
+        return infer[expr_id].clone();
     }
     panic!("Can't find expression")
-}
-
-fn type_at(content: &str) -> String {
-    let (db, file_pos) = TestDB::with_position(content);
-    type_at_pos(&db, file_pos)
 }
 
 fn infer(ra_fixture: &str) -> String {
@@ -77,6 +100,7 @@ fn infer(ra_fixture: &str) -> String {
 }
 
 fn infer_with_mismatches(content: &str, include_mismatches: bool) -> String {
+    let _tracing = setup_tracing();
     let (db, file_id) = TestDB::with_single_file(content);
 
     let mut buf = String::new();
@@ -164,13 +188,19 @@ fn infer_with_mismatches(content: &str, include_mismatches: bool) -> String {
     visit_module(&db, &crate_def_map, module.local_id, &mut |it| defs.push(it));
     defs.sort_by_key(|def| match def {
         DefWithBodyId::FunctionId(it) => {
-            it.lookup(&db).ast_id.to_node(&db).syntax().text_range().start()
+            let loc = it.lookup(&db);
+            let tree = db.item_tree(loc.id.file_id);
+            tree.source(&db, loc.id).syntax().text_range().start()
         }
         DefWithBodyId::ConstId(it) => {
-            it.lookup(&db).ast_id.to_node(&db).syntax().text_range().start()
+            let loc = it.lookup(&db);
+            let tree = db.item_tree(loc.id.file_id);
+            tree.source(&db, loc.id).syntax().text_range().start()
         }
         DefWithBodyId::StaticId(it) => {
-            it.lookup(&db).ast_id.to_node(&db).syntax().text_range().start()
+            let loc = it.lookup(&db);
+            let tree = db.item_tree(loc.id.file_id);
+            tree.source(&db, loc.id).syntax().text_range().start()
         }
     });
     for def in defs {
@@ -302,7 +332,7 @@ fn typing_whitespace_inside_a_function_should_not_invalidate_types() {
     "
     .to_string();
 
-    db.query_mut(ra_db::FileTextQuery).set(pos.file_id, Arc::new(new_text));
+    db.set_file_text(pos.file_id, Arc::new(new_text));
 
     {
         let events = db.log_executed(|| {
@@ -316,236 +346,14 @@ fn typing_whitespace_inside_a_function_should_not_invalidate_types() {
     }
 }
 
-#[test]
-fn no_such_field_diagnostics() {
-    let diagnostics = TestDB::with_files(
-        r"
-        //- /lib.rs
-        struct S { foo: i32, bar: () }
-        impl S {
-            fn new() -> S {
-                S {
-                    foo: 92,
-                    baz: 62,
-                }
-            }
-        }
-        ",
-    )
-    .diagnostics()
-    .0;
-
-    assert_snapshot!(diagnostics, @r###"
-    "baz: 62": no such field
-    "{\n            foo: 92,\n            baz: 62,\n        }": Missing structure fields:
-    - bar
-    "###
-    );
+fn check_infer(ra_fixture: &str, expect: Expect) {
+    let mut actual = infer(ra_fixture);
+    actual.push('\n');
+    expect.assert_eq(&actual);
 }
 
-#[test]
-fn no_such_field_with_feature_flag_diagnostics() {
-    let diagnostics = TestDB::with_files(
-        r#"
-        //- /lib.rs crate:foo cfg:feature=foo
-        struct MyStruct {
-            my_val: usize,
-            #[cfg(feature = "foo")]
-            bar: bool,
-        }
-
-        impl MyStruct {
-            #[cfg(feature = "foo")]
-            pub(crate) fn new(my_val: usize, bar: bool) -> Self {
-                Self { my_val, bar }
-            }
-
-            #[cfg(not(feature = "foo"))]
-            pub(crate) fn new(my_val: usize, _bar: bool) -> Self {
-                Self { my_val }
-            }
-        }
-        "#,
-    )
-    .diagnostics()
-    .0;
-
-    assert_snapshot!(diagnostics, @r###""###);
-}
-
-#[test]
-fn no_such_field_enum_with_feature_flag_diagnostics() {
-    let diagnostics = TestDB::with_files(
-        r#"
-        //- /lib.rs crate:foo cfg:feature=foo
-        enum Foo {
-            #[cfg(not(feature = "foo"))]
-            Buz,
-            #[cfg(feature = "foo")]
-            Bar,
-            Baz
-        }
-
-        fn test_fn(f: Foo) {
-            match f {
-                Foo::Bar => {},
-                Foo::Baz => {},
-            }
-        }
-        "#,
-    )
-    .diagnostics()
-    .0;
-
-    assert_snapshot!(diagnostics, @r###""###);
-}
-
-#[test]
-fn no_such_field_with_feature_flag_diagnostics_on_struct_lit() {
-    let diagnostics = TestDB::with_files(
-        r#"
-        //- /lib.rs crate:foo cfg:feature=foo
-        struct S {
-            #[cfg(feature = "foo")]
-            foo: u32,
-            #[cfg(not(feature = "foo"))]
-            bar: u32,
-        }
-
-        impl S {
-            #[cfg(feature = "foo")]
-            fn new(foo: u32) -> Self {
-                Self { foo }
-            }
-            #[cfg(not(feature = "foo"))]
-            fn new(bar: u32) -> Self {
-                Self { bar }
-            }
-        }
-        "#,
-    )
-    .diagnostics()
-    .0;
-
-    assert_snapshot!(diagnostics, @r###""###);
-}
-
-#[test]
-fn no_such_field_with_feature_flag_diagnostics_on_block_expr() {
-    let diagnostics = TestDB::with_files(
-        r#"
-        //- /lib.rs crate:foo cfg:feature=foo
-        struct S {
-            #[cfg(feature = "foo")]
-            foo: u32,
-            #[cfg(not(feature = "foo"))]
-            bar: u32,
-        }
-
-        impl S {
-            fn new(bar: u32) -> Self {
-                #[cfg(feature = "foo")]
-                {
-                Self { foo: bar }
-                }
-                #[cfg(not(feature = "foo"))]
-                {
-                Self { bar }
-                }
-            }
-        }
-        "#,
-    )
-    .diagnostics()
-    .0;
-
-    assert_snapshot!(diagnostics, @r###""###);
-}
-
-#[test]
-fn no_such_field_with_feature_flag_diagnostics_on_struct_fields() {
-    let diagnostics = TestDB::with_files(
-        r#"
-        //- /lib.rs crate:foo cfg:feature=foo
-        struct S {
-            #[cfg(feature = "foo")]
-            foo: u32,
-            #[cfg(not(feature = "foo"))]
-            bar: u32,
-        }
-
-        impl S {
-            fn new(val: u32) -> Self {
-                Self {
-                    #[cfg(feature = "foo")]
-                    foo: val,
-                    #[cfg(not(feature = "foo"))]
-                    bar: val,
-                }
-            }
-        }
-        "#,
-    )
-    .diagnostics()
-    .0;
-
-    assert_snapshot!(diagnostics, @r###""###);
-}
-
-#[test]
-fn missing_record_pat_field_diagnostic() {
-    let diagnostics = TestDB::with_files(
-        r"
-        //- /lib.rs
-        struct S { foo: i32, bar: () }
-        fn baz(s: S) {
-            let S { foo: _ } = s;
-        }
-        ",
-    )
-    .diagnostics()
-    .0;
-
-    assert_snapshot!(diagnostics, @r###"
-    "{ foo: _ }": Missing structure fields:
-    - bar
-    "###
-    );
-}
-
-#[test]
-fn missing_record_pat_field_no_diagnostic_if_not_exhaustive() {
-    let diagnostics = TestDB::with_files(
-        r"
-        //- /lib.rs
-        struct S { foo: i32, bar: () }
-        fn baz(s: S) -> i32 {
-            match s {
-                S { foo, .. } => foo,
-            }
-        }
-        ",
-    )
-    .diagnostics()
-    .0;
-
-    assert_snapshot!(diagnostics, @"");
-}
-
-#[test]
-fn break_outside_of_loop() {
-    let diagnostics = TestDB::with_files(
-        r"
-        //- /lib.rs
-        fn foo() {
-            break;
-        }
-        ",
-    )
-    .diagnostics()
-    .0;
-
-    assert_snapshot!(diagnostics, @r###""break": break outside of loop
-    "###
-    );
+fn check_infer_with_mismatches(ra_fixture: &str, expect: Expect) {
+    let mut actual = infer_with_mismatches(ra_fixture, true);
+    actual.push('\n');
+    expect.assert_eq(&actual);
 }

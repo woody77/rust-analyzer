@@ -3,7 +3,9 @@
 use std::{collections::HashMap, path::PathBuf};
 
 use lsp_types::request::Request;
-use lsp_types::{Position, Range, TextDocumentIdentifier};
+use lsp_types::{
+    notification::Notification, CodeActionKind, Position, Range, TextDocumentIdentifier,
+};
 use serde::{Deserialize, Serialize};
 
 pub enum AnalyzerStatus {}
@@ -14,12 +16,20 @@ impl Request for AnalyzerStatus {
     const METHOD: &'static str = "rust-analyzer/analyzerStatus";
 }
 
-pub enum CollectGarbage {}
+pub enum MemoryUsage {}
 
-impl Request for CollectGarbage {
+impl Request for MemoryUsage {
+    type Params = ();
+    type Result = String;
+    const METHOD: &'static str = "rust-analyzer/memoryUsage";
+}
+
+pub enum ReloadWorkspace {}
+
+impl Request for ReloadWorkspace {
     type Params = ();
     type Result = ();
-    const METHOD: &'static str = "rust-analyzer/collectGarbage";
+    const METHOD: &'static str = "rust-analyzer/reloadWorkspace";
 }
 
 pub enum SyntaxTree {}
@@ -97,6 +107,22 @@ pub struct JoinLinesParams {
     pub ranges: Vec<Range>,
 }
 
+pub enum ResolveCodeActionRequest {}
+
+impl Request for ResolveCodeActionRequest {
+    type Params = ResolveCodeActionParams;
+    type Result = Option<SnippetWorkspaceEdit>;
+    const METHOD: &'static str = "experimental/resolveCodeAction";
+}
+
+/// Params for the ResolveCodeActionRequest
+#[derive(Debug, Eq, PartialEq, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolveCodeActionParams {
+    pub code_action_params: lsp_types::CodeActionParams,
+    pub id: String,
+}
+
 pub enum OnEnter {}
 
 impl Request for OnEnter {
@@ -145,6 +171,8 @@ pub struct CargoRunnable {
     pub cargo_args: Vec<String>,
     // stuff after --
     pub executable_args: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expect_test: Option<bool>,
 }
 
 pub enum InlayHints {}
@@ -190,6 +218,22 @@ pub struct SsrParams {
     pub parse_only: bool,
 }
 
+pub enum StatusNotification {}
+
+#[serde(rename_all = "camelCase")]
+#[derive(Serialize, Deserialize)]
+pub enum Status {
+    Loading,
+    Ready,
+    NeedsReload,
+    Invalid,
+}
+
+impl Notification for StatusNotification {
+    type Params = Status;
+    const METHOD: &'static str = "rust-analyzer/status";
+}
+
 pub enum CodeActionRequest {}
 
 impl Request for CodeActionRequest {
@@ -199,16 +243,22 @@ impl Request for CodeActionRequest {
 }
 
 #[derive(Debug, PartialEq, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CodeAction {
     pub title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub kind: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub command: Option<lsp_types::Command>,
+    pub kind: Option<CodeActionKind>,
+    // We don't handle commands on the client-side
+    // #[serde(skip_serializing_if = "Option::is_none")]
+    // pub command: Option<lsp_types::Command>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub edit: Option<SnippetWorkspaceEdit>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_preferred: Option<bool>,
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Default, Deserialize, Serialize)]
@@ -241,4 +291,36 @@ pub struct SnippetTextEdit {
     pub new_text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub insert_text_format: Option<lsp_types::InsertTextFormat>,
+}
+
+pub enum HoverRequest {}
+
+impl Request for HoverRequest {
+    type Params = lsp_types::HoverParams;
+    type Result = Option<Hover>;
+    const METHOD: &'static str = "textDocument/hover";
+}
+
+#[derive(Debug, PartialEq, Clone, Deserialize, Serialize)]
+pub struct Hover {
+    #[serde(flatten)]
+    pub hover: lsp_types::Hover,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<CommandLinkGroup>,
+}
+
+#[derive(Debug, PartialEq, Clone, Default, Deserialize, Serialize)]
+pub struct CommandLinkGroup {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub commands: Vec<CommandLink>,
+}
+
+// LSP v3.15 Command does not have a `tooltip` field, vscode supports one.
+#[derive(Debug, PartialEq, Clone, Default, Deserialize, Serialize)]
+pub struct CommandLink {
+    #[serde(flatten)]
+    pub command: lsp_types::Command,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tooltip: Option<String>,
 }

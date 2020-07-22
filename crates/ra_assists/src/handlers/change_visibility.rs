@@ -2,14 +2,13 @@ use ra_syntax::{
     ast::{self, NameOwner, VisibilityOwner},
     AstNode,
     SyntaxKind::{
-        ATTR, COMMENT, CONST_DEF, ENUM_DEF, FN_DEF, MODULE, STRUCT_DEF, TRAIT_DEF, VISIBILITY,
-        WHITESPACE,
+        CONST_DEF, ENUM_DEF, FN_DEF, MODULE, STATIC_DEF, STRUCT_DEF, TRAIT_DEF, VISIBILITY,
     },
-    SyntaxNode, TextSize, T,
+    T,
 };
 use test_utils::mark;
 
-use crate::{AssistContext, AssistId, Assists};
+use crate::{utils::vis_offset, AssistContext, AssistId, AssistKind, Assists};
 
 // Assist: change_visibility
 //
@@ -30,14 +29,16 @@ pub(crate) fn change_visibility(acc: &mut Assists, ctx: &AssistContext) -> Optio
 }
 
 fn add_vis(acc: &mut Assists, ctx: &AssistContext) -> Option<()> {
-    let item_keyword = ctx.token_at_offset().find(|leaf| match leaf.kind() {
-        T![const] | T![fn] | T![mod] | T![struct] | T![enum] | T![trait] => true,
-        _ => false,
+    let item_keyword = ctx.token_at_offset().find(|leaf| {
+        matches!(
+            leaf.kind(),
+            T![const] | T![static] | T![fn] | T![mod] | T![struct] | T![enum] | T![trait]
+        )
     });
 
     let (offset, target) = if let Some(keyword) = item_keyword {
         let parent = keyword.parent();
-        let def_kws = vec![CONST_DEF, FN_DEF, MODULE, STRUCT_DEF, ENUM_DEF, TRAIT_DEF];
+        let def_kws = vec![CONST_DEF, STATIC_DEF, FN_DEF, MODULE, STRUCT_DEF, ENUM_DEF, TRAIT_DEF];
         // Parent is not a definition, can't add visibility
         if !def_kws.iter().any(|&def_kw| def_kw == parent.kind()) {
             return None;
@@ -66,27 +67,21 @@ fn add_vis(acc: &mut Assists, ctx: &AssistContext) -> Option<()> {
         return None;
     };
 
-    acc.add(AssistId("change_visibility"), "Change visibility to pub(crate)", target, |edit| {
-        edit.insert(offset, "pub(crate) ");
-    })
-}
-
-fn vis_offset(node: &SyntaxNode) -> TextSize {
-    node.children_with_tokens()
-        .skip_while(|it| match it.kind() {
-            WHITESPACE | COMMENT | ATTR => true,
-            _ => false,
-        })
-        .next()
-        .map(|it| it.text_range().start())
-        .unwrap_or_else(|| node.text_range().start())
+    acc.add(
+        AssistId("change_visibility", AssistKind::RefactorRewrite),
+        "Change visibility to pub(crate)",
+        target,
+        |edit| {
+            edit.insert(offset, "pub(crate) ");
+        },
+    )
 }
 
 fn change_vis(acc: &mut Assists, vis: ast::Visibility) -> Option<()> {
     if vis.syntax().text() == "pub" {
         let target = vis.syntax().text_range();
         return acc.add(
-            AssistId("change_visibility"),
+            AssistId("change_visibility", AssistKind::RefactorRewrite),
             "Change Visibility to pub(crate)",
             target,
             |edit| {
@@ -97,7 +92,7 @@ fn change_vis(acc: &mut Assists, vis: ast::Visibility) -> Option<()> {
     if vis.syntax().text() == "pub(crate)" {
         let target = vis.syntax().text_range();
         return acc.add(
-            AssistId("change_visibility"),
+            AssistId("change_visibility", AssistKind::RefactorRewrite),
             "Change visibility to pub",
             target,
             |edit| {
@@ -159,6 +154,11 @@ mod tests {
     #[test]
     fn change_visibility_const() {
         check_assist(change_visibility, "<|>const FOO = 3u8;", "pub(crate) const FOO = 3u8;");
+    }
+
+    #[test]
+    fn change_visibility_static() {
+        check_assist(change_visibility, "<|>static FOO = 3u8;", "pub(crate) static FOO = 3u8;");
     }
 
     #[test]

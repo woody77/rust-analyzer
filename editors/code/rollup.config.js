@@ -11,17 +11,11 @@ export default {
         resolve({
             preferBuiltins: true
         }),
-        commonjs({
-            namedExports: {
-                // squelch missing import warnings
-                'vscode-languageclient': ['CreateFile', 'RenameFile', 'ErrorCodes', 'WorkDoneProgress', 'WorkDoneProgressBegin', 'WorkDoneProgressReport', 'WorkDoneProgressEnd']
-            }
-        })
+        commonjs()
     ],
     external: [...nodeBuiltins, 'vscode'],
     output: {
         file: './out/src/main.js',
-        format: 'cjs',
-        exports: 'named'
+        format: 'cjs'
     }
 };

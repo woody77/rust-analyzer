@@ -1,7 +1,12 @@
 //! Fully type-check project and print various stats, like the number of type
 //! errors.
 
-use std::{collections::HashSet, path::Path, time::Instant};
+use std::{path::Path, time::Instant};
+
+use itertools::Itertools;
+use rand::{seq::SliceRandom, thread_rng};
+use rayon::prelude::*;
+use rustc_hash::FxHashSet;
 
 use hir::{
     db::{AstDatabase, DefDatabase, HirDatabase},
@@ -9,13 +14,25 @@ use hir::{
 };
 use hir_def::FunctionId;
 use hir_ty::{Ty, TypeWalk};
-use itertools::Itertools;
-use ra_db::SourceDatabaseExt;
+use ra_db::{
+    salsa::{self, ParallelDatabase},
+    SourceDatabaseExt,
+};
 use ra_syntax::AstNode;
-use rand::{seq::SliceRandom, thread_rng};
 use stdx::format_to;
 
-use crate::cli::{load_cargo::load_cargo, progress_report::ProgressReport, Result, Verbosity};
+use crate::{
+    cli::{load_cargo::load_cargo, progress_report::ProgressReport, Result, Verbosity},
+    print_memory_usage,
+};
+
+/// Need to wrap Snapshot to provide `Clone` impl for `map_with`
+struct Snap<DB>(DB);
+impl<DB: ParallelDatabase> Clone for Snap<salsa::Snapshot<DB>> {
+    fn clone(&self) -> Snap<salsa::Snapshot<DB>> {
+        Snap(self.0.snapshot())
+    }
+}
 
 pub fn analysis_stats(
     verbosity: Verbosity,
@@ -24,29 +41,18 @@ pub fn analysis_stats(
     only: Option<&str>,
     with_deps: bool,
     randomize: bool,
+    parallel: bool,
     load_output_dirs: bool,
     with_proc_macro: bool,
 ) -> Result<()> {
     let db_load_time = Instant::now();
-    let (mut host, roots) = load_cargo(path, load_output_dirs, with_proc_macro)?;
+    let (host, vfs) = load_cargo(path, load_output_dirs, with_proc_macro)?;
     let db = host.raw_database();
-    println!("Database loaded, {} roots, {:?}", roots.len(), db_load_time.elapsed());
+    println!("Database loaded {:?}", db_load_time.elapsed());
     let analysis_time = Instant::now();
     let mut num_crates = 0;
-    let mut visited_modules = HashSet::new();
+    let mut visited_modules = FxHashSet::default();
     let mut visit_queue = Vec::new();
-
-    let members =
-        roots
-            .into_iter()
-            .filter_map(|(source_root_id, project_root)| {
-                if with_deps || project_root.is_member() {
-                    Some(source_root_id)
-                } else {
-                    None
-                }
-            })
-            .collect::<HashSet<_>>();
 
     let mut krates = Crate::all(db);
     if randomize {
@@ -55,7 +61,10 @@ pub fn analysis_stats(
     for krate in krates {
         let module = krate.root_module(db).expect("crate without root module");
         let file_id = module.definition_source(db).file_id;
-        if members.contains(&db.file_source_root(file_id.original_file(db))) {
+        let file_id = file_id.original_file(db);
+        let source_root = db.file_source_root(file_id);
+        let source_root = db.source_root(source_root);
+        if !source_root.is_library || with_deps {
             num_crates += 1;
             visit_queue.push(module);
         }
@@ -98,12 +107,26 @@ pub fn analysis_stats(
         funcs.shuffle(&mut thread_rng());
     }
 
-    let inference_time = Instant::now();
     let mut bar = match verbosity {
         Verbosity::Quiet | Verbosity::Spammy => ProgressReport::hidden(),
         _ => ProgressReport::new(funcs.len() as u64),
     };
 
+    if parallel {
+        let inference_time = Instant::now();
+        let snap = Snap(db.snapshot());
+        funcs
+            .par_iter()
+            .map_with(snap, |snap, &f| {
+                let f_id = FunctionId::from(f);
+                snap.0.body(f_id.into());
+                snap.0.infer(f_id.into());
+            })
+            .count();
+        println!("Parallel Inference: {:?}, {}", inference_time.elapsed(), ra_prof::memory_usage());
+    }
+
+    let inference_time = Instant::now();
     bar.tick();
     let mut num_exprs = 0;
     let mut num_exprs_unknown = 0;
@@ -128,9 +151,9 @@ pub fn analysis_stats(
         if verbosity.is_verbose() {
             let src = f.source(db);
             let original_file = src.file_id.original_file(db);
-            let path = db.file_relative_path(original_file);
+            let path = vfs.file_path(original_file);
             let syntax_range = src.value.syntax().text_range();
-            format_to!(msg, " ({:?} {:?})", path, syntax_range);
+            format_to!(msg, " ({} {:?})", path, syntax_range);
         }
         if verbosity.is_spammy() {
             bar.println(msg.to_string());
@@ -196,7 +219,7 @@ pub fn analysis_stats(
                         let root = db.parse_or_expand(src.file_id).unwrap();
                         let node = src.map(|e| e.to_node(&root).syntax().clone());
                         let original_range = original_range(db, node.as_ref());
-                        let path = db.file_relative_path(original_range.file_id);
+                        let path = vfs.file_path(original_range.file_id);
                         let line_index =
                             host.analysis().file_line_index(original_range.file_id).unwrap();
                         let text_range = original_range.range;
@@ -253,12 +276,7 @@ pub fn analysis_stats(
     println!("Total: {:?}, {}", analysis_time.elapsed(), ra_prof::memory_usage());
 
     if memory_usage {
-        for (name, bytes) in host.per_query_memory_usage() {
-            println!("{:>8} {}", bytes, name)
-        }
-        let before = ra_prof::memory_usage();
-        drop(host);
-        println!("leftover: {}", before.allocated - ra_prof::memory_usage().allocated)
+        print_memory_usage(host, vfs);
     }
 
     Ok(())

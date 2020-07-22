@@ -117,7 +117,7 @@ impl AsName for ast::FieldKind {
 
 impl AsName for ra_db::Dependency {
     fn as_name(&self) -> Name {
-        Name::new_text(self.name.clone())
+        Name::new_text(SmolStr::new(&*self.name))
     }
 }
 
@@ -191,6 +191,8 @@ pub mod known {
         stringify,
         concat,
         include,
+        include_bytes,
+        include_str,
         format_args,
         format_args_nl,
         env,

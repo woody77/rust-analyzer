@@ -1,5 +1,6 @@
 mod tags;
 mod html;
+mod injection;
 #[cfg(test)]
 mod tests;
 
@@ -10,14 +11,14 @@ use ra_ide_db::{
 };
 use ra_prof::profile;
 use ra_syntax::{
-    ast::{self, HasFormatSpecifier, HasQuotes, HasStringValue},
+    ast::{self, HasFormatSpecifier},
     AstNode, AstToken, Direction, NodeOrToken, SyntaxElement,
     SyntaxKind::*,
-    SyntaxToken, TextRange, WalkEvent, T,
+    TextRange, WalkEvent, T,
 };
 use rustc_hash::FxHashMap;
 
-use crate::{call_info::ActiveParameter, Analysis, FileId};
+use crate::FileId;
 
 use ast::FormatSpecifier;
 pub(crate) use html::highlight_as_html;
@@ -43,6 +44,7 @@ pub(crate) fn highlight(
     db: &RootDatabase,
     file_id: FileId,
     range_to_highlight: Option<TextRange>,
+    syntactic_name_ref_highlighting: bool,
 ) -> Vec<HighlightedRange> {
     let _p = profile("highlight");
     let sema = Semantics::new(db);
@@ -103,6 +105,7 @@ pub(crate) fn highlight(
                     if let Some((highlight, binding_hash)) = highlight_element(
                         &sema,
                         &mut bindings_shadow_count,
+                        syntactic_name_ref_highlighting,
                         name.syntax().clone().into(),
                     ) {
                         stack.add(HighlightedRange {
@@ -118,7 +121,23 @@ pub(crate) fn highlight(
                 assert!(current_macro_call == Some(mc));
                 current_macro_call = None;
                 format_string = None;
-                continue;
+            }
+            _ => (),
+        }
+
+        // Check for Rust code in documentation
+        match &event {
+            WalkEvent::Leave(NodeOrToken::Node(node)) => {
+                if let Some((doctest, range_mapping, new_comments)) =
+                    injection::extract_doc_comments(node)
+                {
+                    injection::highlight_doc_comment(
+                        doctest,
+                        range_mapping,
+                        new_comments,
+                        &mut stack,
+                    );
+                }
             }
             _ => (),
         }
@@ -130,7 +149,7 @@ pub(crate) fn highlight(
 
         let range = element.text_range();
 
-        let element_to_highlight = if current_macro_call.is_some() {
+        let element_to_highlight = if current_macro_call.is_some() && element.kind() != COMMENT {
             // Inside a macro -- expand it first
             let token = match element.clone().into_token() {
                 Some(it) if it.parent().kind() == TOKEN_TREE => it,
@@ -142,23 +161,25 @@ pub(crate) fn highlight(
             // Check if macro takes a format string and remember it for highlighting later.
             // The macros that accept a format string expand to a compiler builtin macros
             // `format_args` and `format_args_nl`.
-            if let Some(fmt_macro_call) = parent.parent().and_then(ast::MacroCall::cast) {
-                if let Some(name) =
-                    fmt_macro_call.path().and_then(|p| p.segment()).and_then(|s| s.name_ref())
-                {
-                    match name.text().as_str() {
-                        "format_args" | "format_args_nl" => {
-                            format_string = parent
-                                .children_with_tokens()
-                                .filter(|t| t.kind() != WHITESPACE)
-                                .nth(1)
-                                .filter(|e| {
-                                    ast::String::can_cast(e.kind())
-                                        || ast::RawString::can_cast(e.kind())
-                                })
-                        }
-                        _ => {}
+            if let Some(name) = parent
+                .parent()
+                .and_then(ast::MacroCall::cast)
+                .and_then(|mc| mc.path())
+                .and_then(|p| p.segment())
+                .and_then(|s| s.name_ref())
+            {
+                match name.text().as_str() {
+                    "format_args" | "format_args_nl" => {
+                        format_string = parent
+                            .children_with_tokens()
+                            .filter(|t| t.kind() != WHITESPACE)
+                            .nth(1)
+                            .filter(|e| {
+                                ast::String::can_cast(e.kind())
+                                    || ast::RawString::can_cast(e.kind())
+                            })
                     }
+                    _ => {}
                 }
             }
 
@@ -173,22 +194,25 @@ pub(crate) fn highlight(
 
         if let Some(token) = element.as_token().cloned().and_then(ast::RawString::cast) {
             let expanded = element_to_highlight.as_token().unwrap().clone();
-            if highlight_injection(&mut stack, &sema, token, expanded).is_some() {
+            if injection::highlight_injection(&mut stack, &sema, token, expanded).is_some() {
                 continue;
             }
         }
 
         let is_format_string = format_string.as_ref() == Some(&element_to_highlight);
 
-        if let Some((highlight, binding_hash)) =
-            highlight_element(&sema, &mut bindings_shadow_count, element_to_highlight.clone())
-        {
+        if let Some((highlight, binding_hash)) = highlight_element(
+            &sema,
+            &mut bindings_shadow_count,
+            syntactic_name_ref_highlighting,
+            element_to_highlight.clone(),
+        ) {
             stack.add(HighlightedRange { range, highlight, binding_hash });
             if let Some(string) =
                 element_to_highlight.as_token().cloned().and_then(ast::String::cast)
             {
-                stack.push();
                 if is_format_string {
+                    stack.push();
                     string.lex_format_specifier(|piece_range, kind| {
                         if let Some(highlight) = highlight_format_specifier(kind) {
                             stack.add(HighlightedRange {
@@ -198,13 +222,27 @@ pub(crate) fn highlight(
                             });
                         }
                     });
+                    stack.pop();
                 }
-                stack.pop();
+                // Highlight escape sequences
+                if let Some(char_ranges) = string.char_ranges() {
+                    stack.push();
+                    for (piece_range, _) in char_ranges.iter().filter(|(_, char)| char.is_ok()) {
+                        if string.text()[piece_range.start().into()..].starts_with('\\') {
+                            stack.add(HighlightedRange {
+                                range: piece_range + range.start(),
+                                highlight: HighlightTag::EscapeSequence.into(),
+                                binding_hash: None,
+                            });
+                        }
+                    }
+                    stack.pop_and_inject(None);
+                }
             } else if let Some(string) =
                 element_to_highlight.as_token().cloned().and_then(ast::RawString::cast)
             {
-                stack.push();
                 if is_format_string {
+                    stack.push();
                     string.lex_format_specifier(|piece_range, kind| {
                         if let Some(highlight) = highlight_format_specifier(kind) {
                             stack.add(HighlightedRange {
@@ -214,8 +252,8 @@ pub(crate) fn highlight(
                             });
                         }
                     });
+                    stack.pop();
                 }
-                stack.pop();
             }
         }
     }
@@ -259,9 +297,8 @@ impl HighlightedRangeStack {
             let mut parent = prev.pop().unwrap();
             for ele in children {
                 assert!(parent.range.contains_range(ele.range));
-                let mut cloned = parent.clone();
-                parent.range = TextRange::new(parent.range.start(), ele.range.start());
-                cloned.range = TextRange::new(ele.range.end(), cloned.range.end());
+
+                let cloned = Self::intersect(&mut parent, &ele);
                 if !parent.range.is_empty() {
                     prev.push(parent);
                 }
@@ -270,6 +307,92 @@ impl HighlightedRangeStack {
             }
             if !parent.range.is_empty() {
                 prev.push(parent);
+            }
+        }
+    }
+
+    /// Intersects the `HighlightedRange` `parent` with `child`.
+    /// `parent` is mutated in place, becoming the range before `child`.
+    /// Returns the range (of the same type as `parent`) *after* `child`.
+    fn intersect(parent: &mut HighlightedRange, child: &HighlightedRange) -> HighlightedRange {
+        assert!(parent.range.contains_range(child.range));
+
+        let mut cloned = parent.clone();
+        parent.range = TextRange::new(parent.range.start(), child.range.start());
+        cloned.range = TextRange::new(child.range.end(), cloned.range.end());
+
+        cloned
+    }
+
+    /// Remove the `HighlightRange` of `parent` that's currently covered by `child`.
+    fn intersect_partial(parent: &mut HighlightedRange, child: &HighlightedRange) {
+        assert!(
+            parent.range.start() <= child.range.start()
+                && parent.range.end() >= child.range.start()
+                && child.range.end() > parent.range.end()
+        );
+
+        parent.range = TextRange::new(parent.range.start(), child.range.start());
+    }
+
+    /// Similar to `pop`, but can modify arbitrary prior ranges (where `pop`)
+    /// can only modify the last range currently on the stack.
+    /// Can be used to do injections that span multiple ranges, like the
+    /// doctest injection below.
+    /// If `overwrite_parent` is non-optional, the highlighting of the parent range
+    /// is overwritten with the argument.
+    ///
+    /// Note that `pop` can be simulated by `pop_and_inject(false)` but the
+    /// latter is computationally more expensive.
+    fn pop_and_inject(&mut self, overwrite_parent: Option<Highlight>) {
+        let mut children = self.stack.pop().unwrap();
+        let prev = self.stack.last_mut().unwrap();
+        children.sort_by_key(|range| range.range.start());
+        prev.sort_by_key(|range| range.range.start());
+
+        for child in children {
+            if let Some(idx) =
+                prev.iter().position(|parent| parent.range.contains_range(child.range))
+            {
+                if let Some(tag) = overwrite_parent {
+                    prev[idx].highlight = tag;
+                }
+
+                let cloned = Self::intersect(&mut prev[idx], &child);
+                let insert_idx = if prev[idx].range.is_empty() {
+                    prev.remove(idx);
+                    idx
+                } else {
+                    idx + 1
+                };
+                prev.insert(insert_idx, child);
+                if !cloned.range.is_empty() {
+                    prev.insert(insert_idx + 1, cloned);
+                }
+            } else {
+                let maybe_idx =
+                    prev.iter().position(|parent| parent.range.contains(child.range.start()));
+                match (overwrite_parent, maybe_idx) {
+                    (Some(_), Some(idx)) => {
+                        Self::intersect_partial(&mut prev[idx], &child);
+                        let insert_idx = if prev[idx].range.is_empty() {
+                            prev.remove(idx);
+                            idx
+                        } else {
+                            idx + 1
+                        };
+                        prev.insert(insert_idx, child);
+                    }
+                    (_, None) => {
+                        let idx = prev
+                            .binary_search_by_key(&child.range.start(), |range| range.range.start())
+                            .unwrap_or_else(|x| x);
+                        prev.insert(idx, child);
+                    }
+                    _ => {
+                        unreachable!("child range should be completely contained in parent range");
+                    }
+                }
             }
         }
     }
@@ -335,6 +458,7 @@ fn macro_call_range(macro_call: &ast::MacroCall) -> Option<TextRange> {
 fn highlight_element(
     sema: &Semantics<RootDatabase>,
     bindings_shadow_count: &mut FxHashMap<Name, u32>,
+    syntactic_name_ref_highlighting: bool,
     element: SyntaxElement,
 ) -> Option<(Highlight, Option<u64>)> {
     let db = sema.db;
@@ -363,6 +487,7 @@ fn highlight_element(
                     highlight_name(db, def) | HighlightModifier::Definition
                 }
                 Some(NameClass::ConstReference(def)) => highlight_name(db, def),
+                Some(NameClass::FieldShorthand { .. }) => HighlightTag::Field.into(),
                 None => highlight_name_by_syntax(name) | HighlightModifier::Definition,
             }
         }
@@ -387,12 +512,20 @@ fn highlight_element(
                     }
                     NameRefClass::FieldShorthand { .. } => HighlightTag::Field.into(),
                 },
+                None if syntactic_name_ref_highlighting => highlight_name_ref_by_syntax(name_ref),
                 None => HighlightTag::UnresolvedReference.into(),
             }
         }
 
         // Simple token-based highlighting
-        COMMENT => HighlightTag::Comment.into(),
+        COMMENT => {
+            let comment = element.into_token().and_then(ast::Comment::cast)?;
+            let h = HighlightTag::Comment;
+            match comment.kind().doc {
+                Some(_) => h | HighlightModifier::Documentation,
+                None => h.into(),
+            }
+        }
         STRING | RAW_STRING | RAW_BYTE_STRING | BYTE_STRING => HighlightTag::StringLiteral.into(),
         ATTR => HighlightTag::Attribute.into(),
         INT_NUMBER | FLOAT_NUMBER => HighlightTag::NumericLiteral.into(),
@@ -406,23 +539,52 @@ fn highlight_element(
                 _ => h,
             }
         }
-        PREFIX_EXPR => {
-            let prefix_expr = element.into_node().and_then(ast::PrefixExpr::cast)?;
-            match prefix_expr.op_kind() {
-                Some(ast::PrefixOp::Deref) => {}
-                _ => return None,
+        p if p.is_punct() => match p {
+            T![::] | T![->] | T![=>] | T![&] | T![..] | T![=] | T![@] => {
+                HighlightTag::Operator.into()
             }
-
-            let expr = prefix_expr.expr()?;
-            let ty = sema.type_of_expr(&expr)?;
-            if !ty.is_raw_ptr() {
-                return None;
+            T![!] if element.parent().and_then(ast::MacroCall::cast).is_some() => {
+                HighlightTag::Macro.into()
             }
+            T![*] if element.parent().and_then(ast::PointerType::cast).is_some() => {
+                HighlightTag::Keyword.into()
+            }
+            T![*] if element.parent().and_then(ast::PrefixExpr::cast).is_some() => {
+                let prefix_expr = element.parent().and_then(ast::PrefixExpr::cast)?;
 
-            let mut h = Highlight::new(HighlightTag::Operator);
-            h |= HighlightModifier::Unsafe;
-            h
-        }
+                let expr = prefix_expr.expr()?;
+                let ty = sema.type_of_expr(&expr)?;
+                if ty.is_raw_ptr() {
+                    HighlightTag::Operator | HighlightModifier::Unsafe
+                } else if let Some(ast::PrefixOp::Deref) = prefix_expr.op_kind() {
+                    HighlightTag::Operator.into()
+                } else {
+                    HighlightTag::Punctuation.into()
+                }
+            }
+            T![-] if element.parent().and_then(ast::PrefixExpr::cast).is_some() => {
+                HighlightTag::NumericLiteral.into()
+            }
+            _ if element.parent().and_then(ast::PrefixExpr::cast).is_some() => {
+                HighlightTag::Operator.into()
+            }
+            _ if element.parent().and_then(ast::BinExpr::cast).is_some() => {
+                HighlightTag::Operator.into()
+            }
+            _ if element.parent().and_then(ast::RangeExpr::cast).is_some() => {
+                HighlightTag::Operator.into()
+            }
+            _ if element.parent().and_then(ast::RangePat::cast).is_some() => {
+                HighlightTag::Operator.into()
+            }
+            _ if element.parent().and_then(ast::DotDotPat::cast).is_some() => {
+                HighlightTag::Operator.into()
+            }
+            _ if element.parent().and_then(ast::Attr::cast).is_some() => {
+                HighlightTag::Attribute.into()
+            }
+            _ => HighlightTag::Punctuation.into(),
+        },
 
         k if k.is_keyword() => {
             let h = Highlight::new(HighlightTag::Keyword);
@@ -436,10 +598,31 @@ fn highlight_element(
                 | T![return]
                 | T![while]
                 | T![in] => h | HighlightModifier::ControlFlow,
-                T![for] if !is_child_of_impl(element) => h | HighlightModifier::ControlFlow,
+                T![for] if !is_child_of_impl(&element) => h | HighlightModifier::ControlFlow,
                 T![unsafe] => h | HighlightModifier::Unsafe,
                 T![true] | T![false] => HighlightTag::BoolLiteral.into(),
-                T![self] => HighlightTag::SelfKeyword.into(),
+                T![self] => {
+                    let self_param_is_mut = element
+                        .parent()
+                        .and_then(ast::SelfParam::cast)
+                        .and_then(|p| p.mut_token())
+                        .is_some();
+                    // closure to enforce lazyness
+                    let self_path = || {
+                        sema.resolve_path(&element.parent()?.parent().and_then(ast::Path::cast)?)
+                    };
+                    if self_param_is_mut
+                        || matches!(self_path(),
+                            Some(hir::PathResolution::Local(local))
+                                if local.is_self(db)
+                                    && (local.is_mut(db) || local.ty(db).is_mutable_reference())
+                        )
+                    {
+                        HighlightTag::SelfKeyword | HighlightModifier::Mutable
+                    } else {
+                        HighlightTag::SelfKeyword.into()
+                    }
+                }
                 _ => h,
             }
         }
@@ -462,7 +645,7 @@ fn highlight_element(
     }
 }
 
-fn is_child_of_impl(element: SyntaxElement) -> bool {
+fn is_child_of_impl(element: &SyntaxElement) -> bool {
     match element.parent() {
         Some(e) => e.kind() == IMPL_DEF,
         _ => false,
@@ -500,9 +683,10 @@ fn highlight_name(db: &RootDatabase, def: Definition) -> Highlight {
         },
         Definition::SelfType(_) => HighlightTag::SelfType,
         Definition::TypeParam(_) => HighlightTag::TypeParam,
-        // FIXME: distinguish between locals and parameters
         Definition::Local(local) => {
-            let mut h = Highlight::new(HighlightTag::Local);
+            let tag =
+                if local.is_param(db) { HighlightTag::ValueParam } else { HighlightTag::Local };
+            let mut h = Highlight::new(tag);
             if local.is_mut(db) || local.ty(db).is_mutable_reference() {
                 h |= HighlightModifier::Mutable;
             }
@@ -540,41 +724,52 @@ fn highlight_name_by_syntax(name: ast::Name) -> Highlight {
     tag.into()
 }
 
-fn highlight_injection(
-    acc: &mut HighlightedRangeStack,
-    sema: &Semantics<RootDatabase>,
-    literal: ast::RawString,
-    expanded: SyntaxToken,
-) -> Option<()> {
-    let active_parameter = ActiveParameter::at_token(&sema, expanded)?;
-    if !active_parameter.name.starts_with("ra_fixture") {
-        return None;
-    }
-    let value = literal.value()?;
-    let (analysis, tmp_file_id) = Analysis::from_single_file(value);
+fn highlight_name_ref_by_syntax(name: ast::NameRef) -> Highlight {
+    let default = HighlightTag::UnresolvedReference;
 
-    if let Some(range) = literal.open_quote_text_range() {
-        acc.add(HighlightedRange {
-            range,
-            highlight: HighlightTag::StringLiteral.into(),
-            binding_hash: None,
-        })
-    }
+    let parent = match name.syntax().parent() {
+        Some(it) => it,
+        _ => return default.into(),
+    };
 
-    for mut h in analysis.highlight(tmp_file_id).unwrap() {
-        if let Some(r) = literal.map_range_up(h.range) {
-            h.range = r;
-            acc.add(h)
+    let tag = match parent.kind() {
+        METHOD_CALL_EXPR => HighlightTag::Function,
+        FIELD_EXPR => HighlightTag::Field,
+        PATH_SEGMENT => {
+            let path = match parent.parent().and_then(ast::Path::cast) {
+                Some(it) => it,
+                _ => return default.into(),
+            };
+            let expr = match path.syntax().parent().and_then(ast::PathExpr::cast) {
+                Some(it) => it,
+                _ => {
+                    // within path, decide whether it is module or adt by checking for uppercase name
+                    return if name.text().chars().next().unwrap_or_default().is_uppercase() {
+                        HighlightTag::Struct
+                    } else {
+                        HighlightTag::Module
+                    }
+                    .into();
+                }
+            };
+            let parent = match expr.syntax().parent() {
+                Some(it) => it,
+                None => return default.into(),
+            };
+
+            match parent.kind() {
+                CALL_EXPR => HighlightTag::Function,
+                _ => {
+                    if name.text().chars().next().unwrap_or_default().is_uppercase() {
+                        HighlightTag::Struct
+                    } else {
+                        HighlightTag::Constant
+                    }
+                }
+            }
         }
-    }
+        _ => default,
+    };
 
-    if let Some(range) = literal.close_quote_text_range() {
-        acc.add(HighlightedRange {
-            range,
-            highlight: HighlightTag::StringLiteral.into(),
-            binding_hash: None,
-        })
-    }
-
-    Some(())
+    tag.into()
 }

@@ -4,9 +4,7 @@ use std::{collections::HashMap, path::PathBuf, time::Instant};
 
 use lsp_types::{
     notification::DidOpenTextDocument,
-    request::{
-        CodeActionRequest, Completion, Formatting, GotoDefinition, GotoTypeDefinition, HoverRequest,
-    },
+    request::{CodeActionRequest, Completion, Formatting, GotoTypeDefinition, HoverRequest},
     CodeActionContext, CodeActionParams, CompletionParams, DidOpenTextDocumentParams,
     DocumentFormattingParams, FormattingOptions, GotoDefinitionParams, HoverParams,
     PartialResultParams, Position, Range, TextDocumentItem, TextDocumentPositionParams,
@@ -31,12 +29,12 @@ fn completes_items_from_standard_library() {
     let project_start = Instant::now();
     let server = Project::with_fixture(
         r#"
-//- Cargo.toml
+//- /Cargo.toml
 [package]
 name = "foo"
 version = "0.0.0"
 
-//- src/lib.rs
+//- /src/lib.rs
 use std::collections::Spam;
 "#,
     )
@@ -54,7 +52,7 @@ use std::collections::Spam;
         partial_result_params: PartialResultParams::default(),
         work_done_progress_params: WorkDoneProgressParams::default(),
     });
-    assert!(format!("{}", res).contains("HashMap"));
+    assert!(res.to_string().contains("HashMap"));
     eprintln!("completion took {:?}", completion_start.elapsed());
 }
 
@@ -65,24 +63,24 @@ fn test_runnables_project() {
     }
 
     let code = r#"
-//- foo/Cargo.toml
+//- /foo/Cargo.toml
 [package]
 name = "foo"
 version = "0.0.0"
 
-//- foo/src/lib.rs
+//- /foo/src/lib.rs
 pub fn foo() {}
 
-//- foo/tests/spam.rs
+//- /foo/tests/spam.rs
 #[test]
 fn test_eggs() {}
 
-//- bar/Cargo.toml
+//- /bar/Cargo.toml
 [package]
 name = "bar"
 version = "0.0.0"
 
-//- bar/src/main.rs
+//- /bar/src/main.rs
 fn main() {}
 "#;
 
@@ -142,12 +140,12 @@ fn test_format_document() {
 
     let server = project(
         r#"
-//- Cargo.toml
+//- /Cargo.toml
 [package]
 name = "foo"
 version = "0.0.0"
 
-//- src/lib.rs
+//- /src/lib.rs
 mod bar;
 
 fn main() {
@@ -180,14 +178,8 @@ fn main() {}
 pub use std::collections::HashMap;
 "#,
                 "range": {
-                    "end": {
-                        "character": 0,
-                        "line": 7
-                    },
-                    "start": {
-                        "character": 0,
-                        "line": 0
-                    }
+                    "end": { "character": 0, "line": 6 },
+                    "start": { "character": 0, "line": 0 }
                 }
             }
         ]),
@@ -202,13 +194,13 @@ fn test_format_document_2018() {
 
     let server = project(
         r#"
-//- Cargo.toml
+//- /Cargo.toml
 [package]
 name = "foo"
 version = "0.0.0"
 edition = "2018"
 
-//- src/lib.rs
+//- /src/lib.rs
 mod bar;
 
 async fn test() {
@@ -246,14 +238,8 @@ fn main() {}
 pub use std::collections::HashMap;
 "#,
                 "range": {
-                    "end": {
-                        "character": 0,
-                        "line": 10
-                    },
-                    "start": {
-                        "character": 0,
-                        "line": 0
-                    }
+                    "end": { "character": 0, "line": 9 },
+                    "start": { "character": 0, "line": 0 }
                 }
             }
         ]),
@@ -268,12 +254,12 @@ fn test_missing_module_code_action() {
 
     let server = project(
         r#"
-//- Cargo.toml
+//- /Cargo.toml
 [package]
 name = "foo"
 version = "0.0.0"
 
-//- src/lib.rs
+//- /src/lib.rs
 mod bar;
 
 fn main() {}
@@ -298,6 +284,7 @@ fn main() {}
                 }
               ]
             },
+            "isPreferred": false,
             "kind": "quickfix",
             "title": "Create module"
         }]),
@@ -337,10 +324,10 @@ fn test_missing_module_code_action_in_json_project() {
 
     let code = format!(
         r#"
-//- rust-project.json
+//- /rust-project.json
 {PROJECT}
 
-//- src/lib.rs
+//- /src/lib.rs
 mod bar;
 
 fn main() {{}}
@@ -369,6 +356,7 @@ fn main() {{}}
                 }
               ]
             },
+            "isPreferred": false,
             "kind": "quickfix",
             "title": "Create module"
         }]),
@@ -393,15 +381,15 @@ fn diagnostics_dont_block_typing() {
     }
 
     let librs: String = (0..10).map(|i| format!("mod m{};", i)).collect();
-    let libs: String = (0..10).map(|i| format!("//- src/m{}.rs\nfn foo() {{}}\n\n", i)).collect();
+    let libs: String = (0..10).map(|i| format!("//- /src/m{}.rs\nfn foo() {{}}\n\n", i)).collect();
     let server = Project::with_fixture(&format!(
         r#"
-//- Cargo.toml
+//- /Cargo.toml
 [package]
 name = "foo"
 version = "0.0.0"
 
-//- src/lib.rs
+//- /src/lib.rs
 {}
 
 {}
@@ -451,16 +439,17 @@ fn preserves_dos_line_endings() {
 
     let server = Project::with_fixture(
         &"
-//- Cargo.toml
+//- /Cargo.toml
 [package]
 name = \"foo\"
 version = \"0.0.0\"
 
-//- src/main.rs
+//- /src/main.rs
 /// Some Docs\r\nfn main() {}
 ",
     )
     .server();
+    server.wait_until_workspace_is_loaded();
 
     server.request::<OnEnter>(
         TextDocumentPositionParams {
@@ -486,12 +475,12 @@ fn out_dirs_check() {
 
     let server = Project::with_fixture(
         r###"
-//- Cargo.toml
+//- /Cargo.toml
 [package]
 name = "foo"
 version = "0.0.0"
 
-//- build.rs
+//- /build.rs
 use std::{env, fs, path::Path};
 
 fn main() {
@@ -506,7 +495,12 @@ fn main() {
     println!("cargo:rustc-cfg=featlike=\"set\"");
     println!("cargo:rerun-if-changed=build.rs");
 }
-//- src/main.rs
+//- /src/main.rs
+#[rustc_builtin_macro] macro_rules! include {}
+#[rustc_builtin_macro] macro_rules! include_str {}
+#[rustc_builtin_macro] macro_rules! concat {}
+#[rustc_builtin_macro] macro_rules! env {}
+
 include!(concat!(env!("OUT_DIR"), "/hello.rs"));
 
 #[cfg(atom_cfg)]
@@ -521,10 +515,9 @@ struct B;
 fn main() {
     let va = A;
     let vb = B;
-    message();
+    let should_be_str = message();
+    let another_str = include_str!("main.rs");
 }
-
-fn main() { message(); }
 "###,
     )
     .with_config(|config| {
@@ -532,54 +525,43 @@ fn main() { message(); }
     })
     .server();
     server.wait_until_workspace_is_loaded();
-    let res = server.send_request::<GotoDefinition>(GotoDefinitionParams {
+    let res = server.send_request::<HoverRequest>(HoverParams {
         text_document_position_params: TextDocumentPositionParams::new(
             server.doc_id("src/main.rs"),
-            Position::new(14, 8),
+            Position::new(19, 10),
         ),
         work_done_progress_params: Default::default(),
-        partial_result_params: Default::default(),
     });
-    assert!(format!("{}", res).contains("hello.rs"));
+    assert!(res.to_string().contains("&str"));
+    let res = server.send_request::<HoverRequest>(HoverParams {
+        text_document_position_params: TextDocumentPositionParams::new(
+            server.doc_id("src/main.rs"),
+            Position::new(20, 10),
+        ),
+        work_done_progress_params: Default::default(),
+    });
+    assert!(res.to_string().contains("&str"));
     server.request::<GotoTypeDefinition>(
         GotoDefinitionParams {
             text_document_position_params: TextDocumentPositionParams::new(
                 server.doc_id("src/main.rs"),
-                Position::new(12, 9),
+                Position::new(17, 9),
             ),
             work_done_progress_params: Default::default(),
             partial_result_params: Default::default(),
         },
         json!([{
             "originSelectionRange": {
-                "end": {
-                    "character": 10,
-                    "line": 12
-                },
-                "start": {
-                    "character": 8,
-                    "line": 12
-                }
+                "end": { "character": 10, "line": 17 },
+                "start": { "character": 8, "line": 17 }
             },
             "targetRange": {
-                "end": {
-                    "character": 9,
-                    "line": 3
-                },
-                "start": {
-                    "character": 0,
-                    "line": 2
-                }
+                "end": { "character": 9, "line": 8 },
+                "start": { "character": 0, "line": 7 }
             },
             "targetSelectionRange": {
-                "end": {
-                    "character": 8,
-                    "line": 3
-                },
-                "start": {
-                    "character": 7,
-                    "line": 3
-                }
+                "end": { "character": 8, "line": 8 },
+                "start": { "character": 7, "line": 8 }
             },
             "targetUri": "file:///[..]src/main.rs"
         }]),
@@ -588,41 +570,23 @@ fn main() { message(); }
         GotoDefinitionParams {
             text_document_position_params: TextDocumentPositionParams::new(
                 server.doc_id("src/main.rs"),
-                Position::new(13, 9),
+                Position::new(18, 9),
             ),
             work_done_progress_params: Default::default(),
             partial_result_params: Default::default(),
         },
         json!([{
             "originSelectionRange": {
-                "end": {
-                    "character": 10,
-                    "line": 13
-                },
-                "start": {
-                    "character": 8,
-                    "line":13
-                }
+                "end": { "character": 10, "line": 18 },
+                "start": { "character": 8, "line": 18 }
             },
             "targetRange": {
-                "end": {
-                    "character": 9,
-                    "line": 7
-                },
-                "start": {
-                    "character": 0,
-                    "line":6
-                }
+                "end": { "character": 9, "line": 12 },
+                "start": { "character": 0, "line":11 }
             },
             "targetSelectionRange": {
-                "end": {
-                    "character": 8,
-                    "line": 7
-                },
-                "start": {
-                    "character": 7,
-                    "line": 7
-                }
+                "end": { "character": 8, "line": 12 },
+                "start": { "character": 7, "line": 12 }
             },
             "targetUri": "file:///[..]src/main.rs"
         }]),
@@ -636,7 +600,7 @@ fn resolve_proc_macro() {
     }
     let server = Project::with_fixture(
         r###"
-//- foo/Cargo.toml
+//- /foo/Cargo.toml
 [package]
 name = "foo"
 version = "0.0.0"
@@ -644,7 +608,7 @@ edition = "2018"
 [dependencies]
 bar = {path = "../bar"}
 
-//- foo/src/main.rs
+//- /foo/src/main.rs
 use bar::Bar;
 trait Bar {
   fn bar();
@@ -655,7 +619,7 @@ fn main() {
   Foo::bar();
 }
 
-//- bar/Cargo.toml
+//- /bar/Cargo.toml
 [package]
 name = "bar"
 version = "0.0.0"
@@ -664,7 +628,7 @@ edition = "2018"
 [lib]
 proc-macro = true
 
-//- bar/src/lib.rs
+//- /bar/src/lib.rs
 extern crate proc_macro;
 use proc_macro::{Delimiter, Group, Ident, Span, TokenStream, TokenTree};
 macro_rules! t {

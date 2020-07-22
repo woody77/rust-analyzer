@@ -4,7 +4,7 @@ use ra_syntax::{
     TextRange,
 };
 
-use crate::{AssistContext, AssistId, Assists};
+use crate::{AssistContext, AssistId, AssistKind, Assists};
 
 // Assist: add_explicit_type
 //
@@ -57,9 +57,9 @@ pub(crate) fn add_explicit_type(acc: &mut Assists, ctx: &AssistContext) -> Optio
         return None;
     }
 
-    let inferred_type = ty.display_source_code(ctx.db, module.into()).ok()?;
+    let inferred_type = ty.display_source_code(ctx.db(), module.into()).ok()?;
     acc.add(
-        AssistId("add_explicit_type"),
+        AssistId("add_explicit_type", AssistKind::RefactorRewrite),
         format!("Insert explicit type `{}`", inferred_type),
         pat_range,
         |builder| match ascribed_ty {
@@ -195,7 +195,7 @@ struct Test<K, T = u8> {
 }
 
 fn main() {
-    let test<|> = Test { t: 23, k: 33 };
+    let test<|> = Test { t: 23u8, k: 33 };
 }"#,
             r#"
 struct Test<K, T = u8> {
@@ -204,7 +204,7 @@ struct Test<K, T = u8> {
 }
 
 fn main() {
-    let test: Test<i32> = Test { t: 23, k: 33 };
+    let test: Test<i32> = Test { t: 23u8, k: 33 };
 }"#,
         );
     }

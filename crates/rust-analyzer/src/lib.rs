@@ -17,30 +17,74 @@ macro_rules! eprintln {
     ($($tt:tt)*) => { stdx::eprintln!($($tt)*) };
 }
 
-mod vfs_glob;
+mod global_state;
+mod reload;
+mod main_loop;
+mod dispatch;
+mod handlers;
 mod caps;
 mod cargo_target_spec;
 mod to_proto;
 mod from_proto;
-mod main_loop;
+mod semantic_tokens;
 mod markdown;
+mod diagnostics;
+mod line_endings;
+mod request_metrics;
+mod lsp_utils;
+mod thread_pool;
 pub mod lsp_ext;
 pub mod config;
-mod global_state;
-mod diagnostics;
-mod semantic_tokens;
 
 use serde::de::DeserializeOwned;
 
-pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
-pub use crate::{
-    caps::server_capabilities,
-    main_loop::LspError,
-    main_loop::{main_loop, show_message},
-};
+pub type Result<T, E = Box<dyn std::error::Error + Send + Sync>> = std::result::Result<T, E>;
+pub use crate::{caps::server_capabilities, main_loop::main_loop};
+use ra_ide::AnalysisHost;
+use std::fmt;
+use vfs::Vfs;
 
 pub fn from_json<T: DeserializeOwned>(what: &'static str, json: serde_json::Value) -> Result<T> {
     let res = T::deserialize(&json)
         .map_err(|e| format!("Failed to deserialize {}: {}; {}", what, e, json))?;
     Ok(res)
+}
+
+#[derive(Debug)]
+struct LspError {
+    code: i32,
+    message: String,
+}
+
+impl LspError {
+    fn new(code: i32, message: String) -> LspError {
+        LspError { code, message }
+    }
+}
+
+impl fmt::Display for LspError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Language Server request failed with {}. ({})", self.code, self.message)
+    }
+}
+
+impl std::error::Error for LspError {}
+
+fn print_memory_usage(mut host: AnalysisHost, vfs: Vfs) {
+    let mut mem = host.per_query_memory_usage();
+
+    let before = ra_prof::memory_usage();
+    drop(vfs);
+    let vfs = before.allocated - ra_prof::memory_usage().allocated;
+    mem.push(("VFS".into(), vfs));
+
+    let before = ra_prof::memory_usage();
+    drop(host);
+    mem.push(("Unaccounted".into(), before.allocated - ra_prof::memory_usage().allocated));
+
+    mem.push(("Remaining".into(), ra_prof::memory_usage().allocated));
+
+    for (name, bytes) in mem {
+        println!("{:>8} {}", bytes, name);
+    }
 }

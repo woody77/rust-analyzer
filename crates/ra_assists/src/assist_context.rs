@@ -1,5 +1,7 @@
 //! See `AssistContext`
 
+use std::mem;
+
 use algo::find_covering_element;
 use hir::Semantics;
 use ra_db::{FileId, FileRange};
@@ -17,7 +19,7 @@ use ra_text_edit::TextEditBuilder;
 
 use crate::{
     assist_config::{AssistConfig, SnippetCap},
-    Assist, AssistId, GroupLabel, ResolvedAssist,
+    Assist, AssistId, AssistKind, GroupLabel, ResolvedAssist,
 };
 
 /// `AssistContext` allows to apply an assist or check if it could be applied.
@@ -53,7 +55,6 @@ use crate::{
 pub(crate) struct AssistContext<'a> {
     pub(crate) config: &'a AssistConfig,
     pub(crate) sema: Semantics<'a, RootDatabase>,
-    pub(crate) db: &'a RootDatabase,
     pub(crate) frange: FileRange,
     source_file: SourceFile,
 }
@@ -65,8 +66,11 @@ impl<'a> AssistContext<'a> {
         frange: FileRange,
     ) -> AssistContext<'a> {
         let source_file = sema.parse(frange.file_id);
-        let db = sema.db;
-        AssistContext { config, sema, db, frange, source_file }
+        AssistContext { config, sema, frange, source_file }
+    }
+
+    pub(crate) fn db(&self) -> &RootDatabase {
+        self.sema.db
     }
 
     // NB, this ignores active selection.
@@ -99,14 +103,26 @@ pub(crate) struct Assists {
     resolve: bool,
     file: FileId,
     buf: Vec<(Assist, Option<SourceChange>)>,
+    allowed: Option<Vec<AssistKind>>,
 }
 
 impl Assists {
     pub(crate) fn new_resolved(ctx: &AssistContext) -> Assists {
-        Assists { resolve: true, file: ctx.frange.file_id, buf: Vec::new() }
+        Assists {
+            resolve: true,
+            file: ctx.frange.file_id,
+            buf: Vec::new(),
+            allowed: ctx.config.allowed.clone(),
+        }
     }
+
     pub(crate) fn new_unresolved(ctx: &AssistContext) -> Assists {
-        Assists { resolve: false, file: ctx.frange.file_id, buf: Vec::new() }
+        Assists {
+            resolve: false,
+            file: ctx.frange.file_id,
+            buf: Vec::new(),
+            allowed: ctx.config.allowed.clone(),
+        }
     }
 
     pub(crate) fn finish_unresolved(self) -> Vec<Assist> {
@@ -135,9 +151,13 @@ impl Assists {
         target: TextRange,
         f: impl FnOnce(&mut AssistBuilder),
     ) -> Option<()> {
+        if !self.is_allowed(&id) {
+            return None;
+        }
         let label = Assist::new(id, label.into(), None, target);
         self.add_impl(label, f)
     }
+
     pub(crate) fn add_group(
         &mut self,
         group: &GroupLabel,
@@ -146,9 +166,14 @@ impl Assists {
         target: TextRange,
         f: impl FnOnce(&mut AssistBuilder),
     ) -> Option<()> {
+        if !self.is_allowed(&id) {
+            return None;
+        }
+
         let label = Assist::new(id, label.into(), Some(group.clone()), target);
         self.add_impl(label, f)
     }
+
     fn add_impl(&mut self, label: Assist, f: impl FnOnce(&mut AssistBuilder)) -> Option<()> {
         let source_change = if self.resolve {
             let mut builder = AssistBuilder::new(self.file);
@@ -166,17 +191,43 @@ impl Assists {
         self.buf.sort_by_key(|(label, _edit)| label.target.len());
         self.buf
     }
+
+    fn is_allowed(&self, id: &AssistId) -> bool {
+        match &self.allowed {
+            Some(allowed) => allowed.iter().any(|kind| kind.contains(id.1)),
+            None => true,
+        }
+    }
 }
 
 pub(crate) struct AssistBuilder {
     edit: TextEditBuilder,
-    file: FileId,
+    file_id: FileId,
     is_snippet: bool,
+    change: SourceChange,
 }
 
 impl AssistBuilder {
-    pub(crate) fn new(file: FileId) -> AssistBuilder {
-        AssistBuilder { edit: TextEditBuilder::default(), file, is_snippet: false }
+    pub(crate) fn new(file_id: FileId) -> AssistBuilder {
+        AssistBuilder {
+            edit: TextEditBuilder::default(),
+            file_id,
+            is_snippet: false,
+            change: SourceChange::default(),
+        }
+    }
+
+    pub(crate) fn edit_file(&mut self, file_id: FileId) {
+        self.file_id = file_id;
+    }
+
+    fn commit(&mut self) {
+        let edit = mem::take(&mut self.edit).finish();
+        if !edit.is_empty() {
+            let new_edit = SourceFileEdit { file_id: self.file_id, edit };
+            assert!(!self.change.source_file_edits.iter().any(|it| it.file_id == new_edit.file_id));
+            self.change.source_file_edits.push(new_edit);
+        }
     }
 
     /// Remove specified `range` of text.
@@ -231,12 +282,7 @@ impl AssistBuilder {
     pub(crate) fn rewrite(&mut self, rewriter: SyntaxRewriter) {
         let node = rewriter.rewrite_root().unwrap();
         let new = rewriter.rewrite(&node);
-        algo::diff(&node, &new).into_text_edit(&mut self.edit)
-    }
-
-    // FIXME: better API
-    pub(crate) fn set_file(&mut self, assist_file: FileId) {
-        self.file = assist_file;
+        algo::diff(&node, &new).into_text_edit(&mut self.edit);
     }
 
     // FIXME: kill this API
@@ -245,13 +291,12 @@ impl AssistBuilder {
         &mut self.edit
     }
 
-    fn finish(self) -> SourceChange {
-        let edit = self.edit.finish();
-        let source_file_edit = SourceFileEdit { file_id: self.file, edit };
-        let mut res: SourceChange = source_file_edit.into();
+    fn finish(mut self) -> SourceChange {
+        self.commit();
+        let mut change = mem::take(&mut self.change);
         if self.is_snippet {
-            res.is_snippet = true;
+            change.is_snippet = true;
         }
-        res
+        change
     }
 }

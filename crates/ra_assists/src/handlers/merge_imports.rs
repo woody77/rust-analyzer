@@ -8,7 +8,7 @@ use ra_syntax::{
 
 use crate::{
     assist_context::{AssistContext, Assists},
-    AssistId,
+    AssistId, AssistKind,
 };
 
 // Assist: merge_imports
@@ -56,9 +56,14 @@ pub(crate) fn merge_imports(acc: &mut Assists, ctx: &AssistContext) -> Option<()
     };
 
     let target = tree.syntax().text_range();
-    acc.add(AssistId("merge_imports"), "Merge imports", target, |builder| {
-        builder.rewrite(rewriter);
-    })
+    acc.add(
+        AssistId("merge_imports", AssistKind::RefactorRewrite),
+        "Merge imports",
+        target,
+        |builder| {
+            builder.rewrite(rewriter);
+        },
+    )
 }
 
 fn next_prev() -> impl Iterator<Item = Direction> {
@@ -127,7 +132,7 @@ fn first_path(path: &ast::Path) -> ast::Path {
 
 #[cfg(test)]
 mod tests {
-    use crate::tests::check_assist;
+    use crate::tests::{check_assist, check_assist_not_applicable};
 
     use super::*;
 
@@ -275,5 +280,15 @@ use foo::{
 bar::baz};
 ",
         )
+    }
+
+    #[test]
+    fn test_empty_use() {
+        check_assist_not_applicable(
+            merge_imports,
+            r"
+use std::<|>
+fn main() {}",
+        );
     }
 }

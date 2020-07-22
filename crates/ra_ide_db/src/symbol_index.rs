@@ -29,18 +29,20 @@ use std::{
 };
 
 use fst::{self, Streamer};
+use hir::db::DefDatabase;
 use ra_db::{
     salsa::{self, ParallelDatabase},
-    FileId, SourceDatabaseExt, SourceRootId,
+    CrateId, FileId, SourceDatabaseExt, SourceRootId,
 };
+use ra_prof::profile;
 use ra_syntax::{
     ast::{self, NameOwner},
     match_ast, AstNode, Parse, SmolStr, SourceFile,
     SyntaxKind::{self, *},
     SyntaxNode, SyntaxNodePtr, TextRange, WalkEvent,
 };
-#[cfg(not(feature = "wasm"))]
 use rayon::prelude::*;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::RootDatabase;
 
@@ -85,21 +87,41 @@ impl Query {
 }
 
 #[salsa::query_group(SymbolsDatabaseStorage)]
-pub trait SymbolsDatabase: hir::db::HirDatabase {
+pub trait SymbolsDatabase: hir::db::HirDatabase + SourceDatabaseExt {
     fn file_symbols(&self, file_id: FileId) -> Arc<SymbolIndex>;
-    #[salsa::input]
-    fn library_symbols(&self, id: SourceRootId) -> Arc<SymbolIndex>;
+    fn library_symbols(&self) -> Arc<FxHashMap<SourceRootId, SymbolIndex>>;
     /// The set of "local" (that is, from the current workspace) roots.
     /// Files in local roots are assumed to change frequently.
     #[salsa::input]
-    fn local_roots(&self) -> Arc<Vec<SourceRootId>>;
+    fn local_roots(&self) -> Arc<FxHashSet<SourceRootId>>;
     /// The set of roots for crates.io libraries.
     /// Files in libraries are assumed to never change.
     #[salsa::input]
-    fn library_roots(&self) -> Arc<Vec<SourceRootId>>;
+    fn library_roots(&self) -> Arc<FxHashSet<SourceRootId>>;
 }
 
-fn file_symbols(db: &impl SymbolsDatabase, file_id: FileId) -> Arc<SymbolIndex> {
+fn library_symbols(db: &dyn SymbolsDatabase) -> Arc<FxHashMap<SourceRootId, SymbolIndex>> {
+    let _p = profile("library_symbols");
+
+    let roots = db.library_roots();
+    let res = roots
+        .iter()
+        .map(|&root_id| {
+            let root = db.source_root(root_id);
+            let files = root
+                .iter()
+                .map(|it| (it, SourceDatabaseExt::file_text(db, it)))
+                .collect::<Vec<_>>();
+            let symbol_index = SymbolIndex::for_files(
+                files.into_par_iter().map(|(file, text)| (file, SourceFile::parse(&text))),
+            );
+            (root_id, symbol_index)
+        })
+        .collect();
+    Arc::new(res)
+}
+
+fn file_symbols(db: &dyn SymbolsDatabase, file_id: FileId) -> Arc<SymbolIndex> {
     db.check_canceled();
     let parse = db.parse(file_id);
 
@@ -108,6 +130,14 @@ fn file_symbols(db: &impl SymbolsDatabase, file_id: FileId) -> Arc<SymbolIndex> 
     // FIXME: add macros here
 
     Arc::new(SymbolIndex::new(symbols))
+}
+
+/// Need to wrap Snapshot to provide `Clone` impl for `map_with`
+struct Snap<DB>(DB);
+impl<DB: ParallelDatabase> Clone for Snap<salsa::Snapshot<DB>> {
+    fn clone(&self) -> Snap<salsa::Snapshot<DB>> {
+        Snap(self.0.snapshot())
+    }
 }
 
 // Feature: Workspace Symbol
@@ -132,44 +162,51 @@ fn file_symbols(db: &impl SymbolsDatabase, file_id: FileId) -> Arc<SymbolIndex> 
 // | VS Code | kbd:[Ctrl+T]
 // |===
 pub fn world_symbols(db: &RootDatabase, query: Query) -> Vec<FileSymbol> {
-    /// Need to wrap Snapshot to provide `Clone` impl for `map_with`
-    struct Snap(salsa::Snapshot<RootDatabase>);
-    impl Clone for Snap {
-        fn clone(&self) -> Snap {
-            Snap(self.0.snapshot())
-        }
-    }
+    let _p = ra_prof::profile("world_symbols").detail(|| query.query.clone());
 
-    let buf: Vec<Arc<SymbolIndex>> = if query.libs {
-        let snap = Snap(db.snapshot());
-        #[cfg(not(feature = "wasm"))]
-        let buf = db
-            .library_roots()
-            .par_iter()
-            .map_with(snap, |db, &lib_id| db.0.library_symbols(lib_id))
-            .collect();
-
-        #[cfg(feature = "wasm")]
-        let buf = db.library_roots().iter().map(|&lib_id| snap.0.library_symbols(lib_id)).collect();
-
-        buf
+    let tmp1;
+    let tmp2;
+    let buf: Vec<&SymbolIndex> = if query.libs {
+        tmp1 = db.library_symbols();
+        tmp1.values().collect()
     } else {
         let mut files = Vec::new();
         for &root in db.local_roots().iter() {
             let sr = db.source_root(root);
-            files.extend(sr.walk())
+            files.extend(sr.iter())
         }
 
         let snap = Snap(db.snapshot());
-        #[cfg(not(feature = "wasm"))]
-        let buf =
-            files.par_iter().map_with(snap, |db, &file_id| db.0.file_symbols(file_id)).collect();
-
-        #[cfg(feature = "wasm")]
-        let buf = files.iter().map(|&file_id| snap.0.file_symbols(file_id)).collect();
-
-        buf
+        tmp2 = files
+            .par_iter()
+            .map_with(snap, |db, &file_id| db.0.file_symbols(file_id))
+            .collect::<Vec<_>>();
+        tmp2.iter().map(|it| &**it).collect()
     };
+    query.search(&buf)
+}
+
+pub fn crate_symbols(db: &RootDatabase, krate: CrateId, query: Query) -> Vec<FileSymbol> {
+    // FIXME(#4842): This now depends on CrateDefMap, why not build the entire symbol index from
+    // that instead?
+
+    let def_map = db.crate_def_map(krate);
+    let mut files = Vec::new();
+    let mut modules = vec![def_map.root];
+    while let Some(module) = modules.pop() {
+        let data = &def_map[module];
+        files.extend(data.origin.file_id());
+        modules.extend(data.children.values());
+    }
+
+    let snap = Snap(db.snapshot());
+
+    let buf = files
+        .par_iter()
+        .map_with(snap, |db, &file_id| db.0.file_symbols(file_id))
+        .collect::<Vec<_>>();
+    let buf = buf.iter().map(|it| &**it).collect::<Vec<_>>();
+
     query.search(&buf)
 }
 
@@ -215,11 +252,7 @@ impl SymbolIndex {
             lhs_chars.cmp(rhs_chars)
         }
 
-        #[cfg(not(feature = "wasm"))]
         symbols.par_sort_by(cmp);
-
-        #[cfg(feature = "wasm")]
-        symbols.sort_by(cmp);
 
         let mut builder = fst::MapBuilder::memory();
 
@@ -254,19 +287,8 @@ impl SymbolIndex {
         self.map.as_fst().size() + self.symbols.len() * mem::size_of::<FileSymbol>()
     }
 
-    #[cfg(not(feature = "wasm"))]
     pub(crate) fn for_files(
         files: impl ParallelIterator<Item = (FileId, Parse<ast::SourceFile>)>,
-    ) -> SymbolIndex {
-        let symbols = files
-            .flat_map(|(file_id, file)| source_file_to_file_symbols(&file.tree(), file_id))
-            .collect::<Vec<_>>();
-        SymbolIndex::new(symbols)
-    }
-
-    #[cfg(feature = "wasm")]
-    pub(crate) fn for_files(
-        files: impl Iterator<Item = (FileId, Parse<ast::SourceFile>)>,
     ) -> SymbolIndex {
         let symbols = files
             .flat_map(|(file_id, file)| source_file_to_file_symbols(&file.tree(), file_id))
@@ -289,7 +311,7 @@ impl SymbolIndex {
 }
 
 impl Query {
-    pub(crate) fn search(self, indices: &[Arc<SymbolIndex>]) -> Vec<FileSymbol> {
+    pub(crate) fn search(self, indices: &[&SymbolIndex]) -> Vec<FileSymbol> {
         let mut op = fst::map::OpBuilder::new();
         for file_symbols in indices.iter() {
             let automaton = fst::automaton::Subsequence::new(&self.lowercased);
@@ -298,9 +320,6 @@ impl Query {
         let mut stream = op.union();
         let mut res = Vec::new();
         while let Some((_, indexed_values)) = stream.next() {
-            if res.len() >= self.limit {
-                break;
-            }
             for indexed_value in indexed_values {
                 let symbol_index = &indices[indexed_value.index];
                 let (start, end) = SymbolIndex::map_value_to_range(indexed_value.value);
@@ -312,7 +331,11 @@ impl Query {
                     if self.exact && symbol.name != self.query {
                         continue;
                     }
+
                     res.push(symbol.clone());
+                    if res.len() >= self.limit {
+                        return res;
+                    }
                 }
             }
         }
@@ -321,10 +344,7 @@ impl Query {
 }
 
 fn is_type(kind: SyntaxKind) -> bool {
-    match kind {
-        STRUCT_DEF | ENUM_DEF | TRAIT_DEF | TYPE_ALIAS_DEF => true,
-        _ => false,
-    }
+    matches!(kind, STRUCT_DEF | ENUM_DEF | TRAIT_DEF | TYPE_ALIAS_DEF)
 }
 
 /// The actual data that is stored in the index. It should be as compact as

@@ -1,312 +1,257 @@
-use super::{infer, type_at, type_at_pos};
-use crate::test_db::TestDB;
-use insta::assert_snapshot;
-use ra_db::fixture::WithFixture;
+use expect::expect;
+
+use super::{check_infer, check_types};
 
 #[test]
 fn infer_slice_method() {
-    assert_snapshot!(
-        infer(r#"
-#[lang = "slice"]
-impl<T> [T] {
-    fn foo(&self) -> T {
-        loop {}
-    }
-}
+    check_infer(
+        r#"
+        #[lang = "slice"]
+        impl<T> [T] {
+            fn foo(&self) -> T {
+                loop {}
+            }
+        }
 
-#[lang = "slice_alloc"]
-impl<T> [T] {}
+        #[lang = "slice_alloc"]
+        impl<T> [T] {}
 
-fn test(x: &[u8]) {
-    <[_]>::foo(x);
-}
-"#),
-        @r###"
-    45..49 'self': &[T]
-    56..79 '{     ...     }': T
-    66..73 'loop {}': !
-    71..73 '{}': ()
-    131..132 'x': &[u8]
-    141..163 '{     ...(x); }': ()
-    147..157 '<[_]>::foo': fn foo<u8>(&[u8]) -> u8
-    147..160 '<[_]>::foo(x)': u8
-    158..159 'x': &[u8]
-    "###
+        fn test(x: &[u8]) {
+            <[_]>::foo(x);
+        }
+        "#,
+        expect![[r#"
+            44..48 'self': &[T]
+            55..78 '{     ...     }': T
+            65..72 'loop {}': !
+            70..72 '{}': ()
+            130..131 'x': &[u8]
+            140..162 '{     ...(x); }': ()
+            146..156 '<[_]>::foo': fn foo<u8>(&[u8]) -> u8
+            146..159 '<[_]>::foo(x)': u8
+            157..158 'x': &[u8]
+        "#]],
     );
 }
 
 #[test]
 fn infer_associated_method_struct() {
-    assert_snapshot!(
-        infer(r#"
-struct A { x: u32 }
+    check_infer(
+        r#"
+        struct A { x: u32 }
 
-impl A {
-    fn new() -> A {
-        A { x: 0 }
-    }
-}
-fn test() {
-    let a = A::new();
-    a.x;
-}
-"#),
-        @r###"
-    49..75 '{     ...     }': A
-    59..69 'A { x: 0 }': A
-    66..67 '0': u32
-    88..122 '{     ...a.x; }': ()
-    98..99 'a': A
-    102..108 'A::new': fn new() -> A
-    102..110 'A::new()': A
-    116..117 'a': A
-    116..119 'a.x': u32
-    "###
+        impl A {
+            fn new() -> A {
+                A { x: 0 }
+            }
+        }
+        fn test() {
+            let a = A::new();
+            a.x;
+        }
+        "#,
+        expect![[r#"
+            48..74 '{     ...     }': A
+            58..68 'A { x: 0 }': A
+            65..66 '0': u32
+            87..121 '{     ...a.x; }': ()
+            97..98 'a': A
+            101..107 'A::new': fn new() -> A
+            101..109 'A::new()': A
+            115..116 'a': A
+            115..118 'a.x': u32
+        "#]],
     );
 }
 
 #[test]
 fn infer_associated_method_enum() {
-    assert_snapshot!(
-        infer(r#"
-enum A { B, C }
+    check_infer(
+        r#"
+        enum A { B, C }
 
-impl A {
-    pub fn b() -> A {
-        A::B
-    }
-    pub fn c() -> A {
-        A::C
-    }
-}
-fn test() {
-    let a = A::b();
-    a;
-    let c = A::c();
-    c;
-}
-"#),
-        @r###"
-    47..67 '{     ...     }': A
-    57..61 'A::B': A
-    88..108 '{     ...     }': A
-    98..102 'A::C': A
-    121..178 '{     ...  c; }': ()
-    131..132 'a': A
-    135..139 'A::b': fn b() -> A
-    135..141 'A::b()': A
-    147..148 'a': A
-    158..159 'c': A
-    162..166 'A::c': fn c() -> A
-    162..168 'A::c()': A
-    174..175 'c': A
-    "###
+        impl A {
+            pub fn b() -> A {
+                A::B
+            }
+            pub fn c() -> A {
+                A::C
+            }
+        }
+        fn test() {
+            let a = A::b();
+            a;
+            let c = A::c();
+            c;
+        }
+        "#,
+        expect![[r#"
+            46..66 '{     ...     }': A
+            56..60 'A::B': A
+            87..107 '{     ...     }': A
+            97..101 'A::C': A
+            120..177 '{     ...  c; }': ()
+            130..131 'a': A
+            134..138 'A::b': fn b() -> A
+            134..140 'A::b()': A
+            146..147 'a': A
+            157..158 'c': A
+            161..165 'A::c': fn c() -> A
+            161..167 'A::c()': A
+            173..174 'c': A
+        "#]],
     );
 }
 
 #[test]
 fn infer_associated_method_with_modules() {
-    assert_snapshot!(
-        infer(r#"
-mod a {
-    struct A;
-    impl A { pub fn thing() -> A { A {} }}
-}
+    check_infer(
+        r#"
+        mod a {
+            struct A;
+            impl A { pub fn thing() -> A { A {} }}
+        }
 
-mod b {
-    struct B;
-    impl B { pub fn thing() -> u32 { 99 }}
+        mod b {
+            struct B;
+            impl B { pub fn thing() -> u32 { 99 }}
 
-    mod c {
-        struct C;
-        impl C { pub fn thing() -> C { C {} }}
-    }
-}
-use b::c;
+            mod c {
+                struct C;
+                impl C { pub fn thing() -> C { C {} }}
+            }
+        }
+        use b::c;
 
-fn test() {
-    let x = a::A::thing();
-    let y = b::B::thing();
-    let z = c::C::thing();
-}
-"#),
-        @r###"
-    56..64 '{ A {} }': A
-    58..62 'A {}': A
-    126..132 '{ 99 }': u32
-    128..130 '99': u32
-    202..210 '{ C {} }': C
-    204..208 'C {}': C
-    241..325 '{     ...g(); }': ()
-    251..252 'x': A
-    255..266 'a::A::thing': fn thing() -> A
-    255..268 'a::A::thing()': A
-    278..279 'y': u32
-    282..293 'b::B::thing': fn thing() -> u32
-    282..295 'b::B::thing()': u32
-    305..306 'z': C
-    309..320 'c::C::thing': fn thing() -> C
-    309..322 'c::C::thing()': C
-    "###
+        fn test() {
+            let x = a::A::thing();
+            let y = b::B::thing();
+            let z = c::C::thing();
+        }
+        "#,
+        expect![[r#"
+            55..63 '{ A {} }': A
+            57..61 'A {}': A
+            125..131 '{ 99 }': u32
+            127..129 '99': u32
+            201..209 '{ C {} }': C
+            203..207 'C {}': C
+            240..324 '{     ...g(); }': ()
+            250..251 'x': A
+            254..265 'a::A::thing': fn thing() -> A
+            254..267 'a::A::thing()': A
+            277..278 'y': u32
+            281..292 'b::B::thing': fn thing() -> u32
+            281..294 'b::B::thing()': u32
+            304..305 'z': C
+            308..319 'c::C::thing': fn thing() -> C
+            308..321 'c::C::thing()': C
+        "#]],
     );
 }
 
 #[test]
 fn infer_associated_method_generics() {
-    assert_snapshot!(
-        infer(r#"
-struct Gen<T> {
-    val: T
-}
-
-impl<T> Gen<T> {
-    pub fn make(val: T) -> Gen<T> {
-        Gen { val }
-    }
-}
-
-fn test() {
-    let a = Gen::make(0u32);
-}
-"#),
-        @r###"
-    64..67 'val': T
-    82..109 '{     ...     }': Gen<T>
-    92..103 'Gen { val }': Gen<T>
-    98..101 'val': T
-    123..155 '{     ...32); }': ()
-    133..134 'a': Gen<u32>
-    137..146 'Gen::make': fn make<u32>(u32) -> Gen<u32>
-    137..152 'Gen::make(0u32)': Gen<u32>
-    147..151 '0u32': u32
-    "###
-    );
-}
-
-#[test]
-fn infer_associated_method_generics_with_default_param() {
-    assert_snapshot!(
-        infer(r#"
-struct Gen<T=u32> {
-    val: T
-}
-
-impl<T> Gen<T> {
-    pub fn make() -> Gen<T> {
-        loop { }
-    }
-}
-
-fn test() {
-    let a = Gen::make();
-}
-"#),
-        @r###"
-    80..104 '{     ...     }': Gen<T>
-    90..98 'loop { }': !
-    95..98 '{ }': ()
-    118..146 '{     ...e(); }': ()
-    128..129 'a': Gen<u32>
-    132..141 'Gen::make': fn make<u32>() -> Gen<u32>
-    132..143 'Gen::make()': Gen<u32>
-    "###
-    );
-}
-
-#[test]
-fn infer_associated_method_generics_with_default_tuple_param() {
-    let t = type_at(
+    check_infer(
         r#"
-//- /main.rs
-struct Gen<T=()> {
-    val: T
-}
+        struct Gen<T> {
+            val: T
+        }
 
-impl<T> Gen<T> {
-    pub fn make() -> Gen<T> {
-        loop { }
-    }
-}
+        impl<T> Gen<T> {
+            pub fn make(val: T) -> Gen<T> {
+                Gen { val }
+            }
+        }
 
-fn test() {
-    let a = Gen::make();
-    a.val<|>;
-}
-"#,
+        fn test() {
+            let a = Gen::make(0u32);
+        }
+        "#,
+        expect![[r#"
+            63..66 'val': T
+            81..108 '{     ...     }': Gen<T>
+            91..102 'Gen { val }': Gen<T>
+            97..100 'val': T
+            122..154 '{     ...32); }': ()
+            132..133 'a': Gen<u32>
+            136..145 'Gen::make': fn make<u32>(u32) -> Gen<u32>
+            136..151 'Gen::make(0u32)': Gen<u32>
+            146..150 '0u32': u32
+        "#]],
     );
-    assert_eq!(t, "()");
 }
 
 #[test]
 fn infer_associated_method_generics_without_args() {
-    assert_snapshot!(
-        infer(r#"
-struct Gen<T> {
-    val: T
-}
+    check_infer(
+        r#"
+        struct Gen<T> {
+            val: T
+        }
 
-impl<T> Gen<T> {
-    pub fn make() -> Gen<T> {
-        loop { }
-    }
-}
+        impl<T> Gen<T> {
+            pub fn make() -> Gen<T> {
+                loop { }
+            }
+        }
 
-fn test() {
-    let a = Gen::<u32>::make();
-}
-"#),
-        @r###"
-    76..100 '{     ...     }': Gen<T>
-    86..94 'loop { }': !
-    91..94 '{ }': ()
-    114..149 '{     ...e(); }': ()
-    124..125 'a': Gen<u32>
-    128..144 'Gen::<...::make': fn make<u32>() -> Gen<u32>
-    128..146 'Gen::<...make()': Gen<u32>
-    "###
+        fn test() {
+            let a = Gen::<u32>::make();
+        }
+        "#,
+        expect![[r#"
+            75..99 '{     ...     }': Gen<T>
+            85..93 'loop { }': !
+            90..93 '{ }': ()
+            113..148 '{     ...e(); }': ()
+            123..124 'a': Gen<u32>
+            127..143 'Gen::<...::make': fn make<u32>() -> Gen<u32>
+            127..145 'Gen::<...make()': Gen<u32>
+        "#]],
     );
 }
 
 #[test]
 fn infer_associated_method_generics_2_type_params_without_args() {
-    assert_snapshot!(
-        infer(r#"
-struct Gen<T, U> {
-    val: T,
-    val2: U,
-}
+    check_infer(
+        r#"
+        struct Gen<T, U> {
+            val: T,
+            val2: U,
+        }
 
-impl<T> Gen<u32, T> {
-    pub fn make() -> Gen<u32,T> {
-        loop { }
-    }
-}
+        impl<T> Gen<u32, T> {
+            pub fn make() -> Gen<u32,T> {
+                loop { }
+            }
+        }
 
-fn test() {
-    let a = Gen::<u32, u64>::make();
-}
-"#),
-        @r###"
-    102..126 '{     ...     }': Gen<u32, T>
-    112..120 'loop { }': !
-    117..120 '{ }': ()
-    140..180 '{     ...e(); }': ()
-    150..151 'a': Gen<u32, u64>
-    154..175 'Gen::<...::make': fn make<u64>() -> Gen<u32, u64>
-    154..177 'Gen::<...make()': Gen<u32, u64>
-    "###
+        fn test() {
+            let a = Gen::<u32, u64>::make();
+        }
+        "#,
+        expect![[r#"
+            101..125 '{     ...     }': Gen<u32, T>
+            111..119 'loop { }': !
+            116..119 '{ }': ()
+            139..179 '{     ...e(); }': ()
+            149..150 'a': Gen<u32, u64>
+            153..174 'Gen::<...::make': fn make<u64>() -> Gen<u32, u64>
+            153..176 'Gen::<...make()': Gen<u32, u64>
+        "#]],
     );
 }
 
 #[test]
 fn cross_crate_associated_method_call() {
-    let (db, pos) = TestDB::with_position(
+    check_types(
         r#"
 //- /main.rs crate:main deps:other_crate
 fn test() {
     let x = other_crate::foo::S::thing();
-    x<|>;
-}
+    x;
+} //^ i128
 
 //- /lib.rs crate:other_crate
 mod foo {
@@ -317,556 +262,547 @@ mod foo {
 }
 "#,
     );
-    assert_eq!("i128", type_at_pos(&db, pos));
 }
 
 #[test]
 fn infer_trait_method_simple() {
     // the trait implementation is intentionally incomplete -- it shouldn't matter
-    assert_snapshot!(
-        infer(r#"
-trait Trait1 {
-    fn method(&self) -> u32;
-}
-struct S1;
-impl Trait1 for S1 {}
-trait Trait2 {
-    fn method(&self) -> i128;
-}
-struct S2;
-impl Trait2 for S2 {}
-fn test() {
-    S1.method(); // -> u32
-    S2.method(); // -> i128
-}
-"#),
-        @r###"
-    31..35 'self': &Self
-    110..114 'self': &Self
-    170..228 '{     ...i128 }': ()
-    176..178 'S1': S1
-    176..187 'S1.method()': u32
-    203..205 'S2': S2
-    203..214 'S2.method()': i128
-    "###
+    check_infer(
+        r#"
+        trait Trait1 {
+            fn method(&self) -> u32;
+        }
+        struct S1;
+        impl Trait1 for S1 {}
+        trait Trait2 {
+            fn method(&self) -> i128;
+        }
+        struct S2;
+        impl Trait2 for S2 {}
+        fn test() {
+            S1.method(); // -> u32
+            S2.method(); // -> i128
+        }
+        "#,
+        expect![[r#"
+            30..34 'self': &Self
+            109..113 'self': &Self
+            169..227 '{     ...i128 }': ()
+            175..177 'S1': S1
+            175..186 'S1.method()': u32
+            202..204 'S2': S2
+            202..213 'S2.method()': i128
+        "#]],
     );
 }
 
 #[test]
 fn infer_trait_method_scoped() {
     // the trait implementation is intentionally incomplete -- it shouldn't matter
-    assert_snapshot!(
-        infer(r#"
-struct S;
-mod foo {
-    pub trait Trait1 {
-        fn method(&self) -> u32;
-    }
-    impl Trait1 for super::S {}
-}
-mod bar {
-    pub trait Trait2 {
-        fn method(&self) -> i128;
-    }
-    impl Trait2 for super::S {}
-}
+    check_infer(
+        r#"
+        struct S;
+        mod foo {
+            pub trait Trait1 {
+                fn method(&self) -> u32;
+            }
+            impl Trait1 for super::S {}
+        }
+        mod bar {
+            pub trait Trait2 {
+                fn method(&self) -> i128;
+            }
+            impl Trait2 for super::S {}
+        }
 
-mod foo_test {
-    use super::S;
-    use super::foo::Trait1;
-    fn test() {
-        S.method(); // -> u32
-    }
-}
+        mod foo_test {
+            use super::S;
+            use super::foo::Trait1;
+            fn test() {
+                S.method(); // -> u32
+            }
+        }
 
-mod bar_test {
-    use super::S;
-    use super::bar::Trait2;
-    fn test() {
-        S.method(); // -> i128
-    }
-}
-"#),
-        @r###"
-    63..67 'self': &Self
-    169..173 'self': &Self
-    300..337 '{     ...     }': ()
-    310..311 'S': S
-    310..320 'S.method()': u32
-    416..454 '{     ...     }': ()
-    426..427 'S': S
-    426..436 'S.method()': i128
-    "###
+        mod bar_test {
+            use super::S;
+            use super::bar::Trait2;
+            fn test() {
+                S.method(); // -> i128
+            }
+        }
+        "#,
+        expect![[r#"
+            62..66 'self': &Self
+            168..172 'self': &Self
+            299..336 '{     ...     }': ()
+            309..310 'S': S
+            309..319 'S.method()': u32
+            415..453 '{     ...     }': ()
+            425..426 'S': S
+            425..435 'S.method()': i128
+        "#]],
     );
 }
 
 #[test]
 fn infer_trait_method_generic_1() {
     // the trait implementation is intentionally incomplete -- it shouldn't matter
-    assert_snapshot!(
-        infer(r#"
-trait Trait<T> {
-    fn method(&self) -> T;
-}
-struct S;
-impl Trait<u32> for S {}
-fn test() {
-    S.method();
-}
-"#),
-        @r###"
-    33..37 'self': &Self
-    92..111 '{     ...d(); }': ()
-    98..99 'S': S
-    98..108 'S.method()': u32
-    "###
+    check_infer(
+        r#"
+        trait Trait<T> {
+            fn method(&self) -> T;
+        }
+        struct S;
+        impl Trait<u32> for S {}
+        fn test() {
+            S.method();
+        }
+        "#,
+        expect![[r#"
+            32..36 'self': &Self
+            91..110 '{     ...d(); }': ()
+            97..98 'S': S
+            97..107 'S.method()': u32
+        "#]],
     );
 }
 
 #[test]
 fn infer_trait_method_generic_more_params() {
     // the trait implementation is intentionally incomplete -- it shouldn't matter
-    assert_snapshot!(
-        infer(r#"
-trait Trait<T1, T2, T3> {
-    fn method1(&self) -> (T1, T2, T3);
-    fn method2(&self) -> (T3, T2, T1);
-}
-struct S1;
-impl Trait<u8, u16, u32> for S1 {}
-struct S2;
-impl<T> Trait<i8, i16, T> for S2 {}
-fn test() {
-    S1.method1(); // u8, u16, u32
-    S1.method2(); // u32, u16, u8
-    S2.method1(); // i8, i16, {unknown}
-    S2.method2(); // {unknown}, i16, i8
-}
-"#),
-        @r###"
-    43..47 'self': &Self
-    82..86 'self': &Self
-    210..361 '{     ..., i8 }': ()
-    216..218 'S1': S1
-    216..228 'S1.method1()': (u8, u16, u32)
-    250..252 'S1': S1
-    250..262 'S1.method2()': (u32, u16, u8)
-    284..286 'S2': S2
-    284..296 'S2.method1()': (i8, i16, {unknown})
-    324..326 'S2': S2
-    324..336 'S2.method2()': ({unknown}, i16, i8)
-    "###
+    check_infer(
+        r#"
+        trait Trait<T1, T2, T3> {
+            fn method1(&self) -> (T1, T2, T3);
+            fn method2(&self) -> (T3, T2, T1);
+        }
+        struct S1;
+        impl Trait<u8, u16, u32> for S1 {}
+        struct S2;
+        impl<T> Trait<i8, i16, T> for S2 {}
+        fn test() {
+            S1.method1(); // u8, u16, u32
+            S1.method2(); // u32, u16, u8
+            S2.method1(); // i8, i16, {unknown}
+            S2.method2(); // {unknown}, i16, i8
+        }
+        "#,
+        expect![[r#"
+            42..46 'self': &Self
+            81..85 'self': &Self
+            209..360 '{     ..., i8 }': ()
+            215..217 'S1': S1
+            215..227 'S1.method1()': (u8, u16, u32)
+            249..251 'S1': S1
+            249..261 'S1.method2()': (u32, u16, u8)
+            283..285 'S2': S2
+            283..295 'S2.method1()': (i8, i16, {unknown})
+            323..325 'S2': S2
+            323..335 'S2.method2()': ({unknown}, i16, i8)
+        "#]],
     );
 }
 
 #[test]
 fn infer_trait_method_generic_2() {
     // the trait implementation is intentionally incomplete -- it shouldn't matter
-    assert_snapshot!(
-        infer(r#"
-trait Trait<T> {
-    fn method(&self) -> T;
-}
-struct S<T>(T);
-impl<U> Trait<U> for S<U> {}
-fn test() {
-    S(1u32).method();
-}
-"#),
-        @r###"
-    33..37 'self': &Self
-    102..127 '{     ...d(); }': ()
-    108..109 'S': S<u32>(u32) -> S<u32>
-    108..115 'S(1u32)': S<u32>
-    108..124 'S(1u32...thod()': u32
-    110..114 '1u32': u32
-    "###
+    check_infer(
+        r#"
+        trait Trait<T> {
+            fn method(&self) -> T;
+        }
+        struct S<T>(T);
+        impl<U> Trait<U> for S<U> {}
+        fn test() {
+            S(1u32).method();
+        }
+        "#,
+        expect![[r#"
+            32..36 'self': &Self
+            101..126 '{     ...d(); }': ()
+            107..108 'S': S<u32>(u32) -> S<u32>
+            107..114 'S(1u32)': S<u32>
+            107..123 'S(1u32...thod()': u32
+            109..113 '1u32': u32
+        "#]],
     );
 }
 
 #[test]
 fn infer_trait_assoc_method() {
-    assert_snapshot!(
-        infer(r#"
-trait Default {
-    fn default() -> Self;
-}
-struct S;
-impl Default for S {}
-fn test() {
-    let s1: S = Default::default();
-    let s2 = S::default();
-    let s3 = <S as Default>::default();
-}
-"#),
-        @r###"
-    87..193 '{     ...t(); }': ()
-    97..99 's1': S
-    105..121 'Defaul...efault': fn default<S>() -> S
-    105..123 'Defaul...ault()': S
-    133..135 's2': S
-    138..148 'S::default': fn default<S>() -> S
-    138..150 'S::default()': S
-    160..162 's3': S
-    165..188 '<S as ...efault': fn default<S>() -> S
-    165..190 '<S as ...ault()': S
-    "###
+    check_infer(
+        r#"
+        trait Default {
+            fn default() -> Self;
+        }
+        struct S;
+        impl Default for S {}
+        fn test() {
+            let s1: S = Default::default();
+            let s2 = S::default();
+            let s3 = <S as Default>::default();
+        }
+        "#,
+        expect![[r#"
+            86..192 '{     ...t(); }': ()
+            96..98 's1': S
+            104..120 'Defaul...efault': fn default<S>() -> S
+            104..122 'Defaul...ault()': S
+            132..134 's2': S
+            137..147 'S::default': fn default<S>() -> S
+            137..149 'S::default()': S
+            159..161 's3': S
+            164..187 '<S as ...efault': fn default<S>() -> S
+            164..189 '<S as ...ault()': S
+        "#]],
     );
 }
 
 #[test]
 fn infer_trait_assoc_method_generics_1() {
-    assert_snapshot!(
-        infer(r#"
-trait Trait<T> {
-    fn make() -> T;
-}
-struct S;
-impl Trait<u32> for S {}
-struct G<T>;
-impl<T> Trait<T> for G<T> {}
-fn test() {
-    let a = S::make();
-    let b = G::<u64>::make();
-    let c: f64 = G::make();
-}
-"#),
-        @r###"
-    127..211 '{     ...e(); }': ()
-    137..138 'a': u32
-    141..148 'S::make': fn make<S, u32>() -> u32
-    141..150 'S::make()': u32
-    160..161 'b': u64
-    164..178 'G::<u64>::make': fn make<G<u64>, u64>() -> u64
-    164..180 'G::<u6...make()': u64
-    190..191 'c': f64
-    199..206 'G::make': fn make<G<f64>, f64>() -> f64
-    199..208 'G::make()': f64
-    "###
+    check_infer(
+        r#"
+        trait Trait<T> {
+            fn make() -> T;
+        }
+        struct S;
+        impl Trait<u32> for S {}
+        struct G<T>;
+        impl<T> Trait<T> for G<T> {}
+        fn test() {
+            let a = S::make();
+            let b = G::<u64>::make();
+            let c: f64 = G::make();
+        }
+        "#,
+        expect![[r#"
+            126..210 '{     ...e(); }': ()
+            136..137 'a': u32
+            140..147 'S::make': fn make<S, u32>() -> u32
+            140..149 'S::make()': u32
+            159..160 'b': u64
+            163..177 'G::<u64>::make': fn make<G<u64>, u64>() -> u64
+            163..179 'G::<u6...make()': u64
+            189..190 'c': f64
+            198..205 'G::make': fn make<G<f64>, f64>() -> f64
+            198..207 'G::make()': f64
+        "#]],
     );
 }
 
 #[test]
 fn infer_trait_assoc_method_generics_2() {
-    assert_snapshot!(
-        infer(r#"
-trait Trait<T> {
-    fn make<U>() -> (T, U);
-}
-struct S;
-impl Trait<u32> for S {}
-struct G<T>;
-impl<T> Trait<T> for G<T> {}
-fn test() {
-    let a = S::make::<i64>();
-    let b: (_, i64) = S::make();
-    let c = G::<u32>::make::<i64>();
-    let d: (u32, _) = G::make::<i64>();
-    let e: (u32, i64) = G::make();
-}
-"#),
-        @r###"
-    135..313 '{     ...e(); }': ()
-    145..146 'a': (u32, i64)
-    149..163 'S::make::<i64>': fn make<S, u32, i64>() -> (u32, i64)
-    149..165 'S::mak...i64>()': (u32, i64)
-    175..176 'b': (u32, i64)
-    189..196 'S::make': fn make<S, u32, i64>() -> (u32, i64)
-    189..198 'S::make()': (u32, i64)
-    208..209 'c': (u32, i64)
-    212..233 'G::<u3...:<i64>': fn make<G<u32>, u32, i64>() -> (u32, i64)
-    212..235 'G::<u3...i64>()': (u32, i64)
-    245..246 'd': (u32, i64)
-    259..273 'G::make::<i64>': fn make<G<u32>, u32, i64>() -> (u32, i64)
-    259..275 'G::mak...i64>()': (u32, i64)
-    285..286 'e': (u32, i64)
-    301..308 'G::make': fn make<G<u32>, u32, i64>() -> (u32, i64)
-    301..310 'G::make()': (u32, i64)
-    "###
+    check_infer(
+        r#"
+        trait Trait<T> {
+            fn make<U>() -> (T, U);
+        }
+        struct S;
+        impl Trait<u32> for S {}
+        struct G<T>;
+        impl<T> Trait<T> for G<T> {}
+        fn test() {
+            let a = S::make::<i64>();
+            let b: (_, i64) = S::make();
+            let c = G::<u32>::make::<i64>();
+            let d: (u32, _) = G::make::<i64>();
+            let e: (u32, i64) = G::make();
+        }
+        "#,
+        expect![[r#"
+            134..312 '{     ...e(); }': ()
+            144..145 'a': (u32, i64)
+            148..162 'S::make::<i64>': fn make<S, u32, i64>() -> (u32, i64)
+            148..164 'S::mak...i64>()': (u32, i64)
+            174..175 'b': (u32, i64)
+            188..195 'S::make': fn make<S, u32, i64>() -> (u32, i64)
+            188..197 'S::make()': (u32, i64)
+            207..208 'c': (u32, i64)
+            211..232 'G::<u3...:<i64>': fn make<G<u32>, u32, i64>() -> (u32, i64)
+            211..234 'G::<u3...i64>()': (u32, i64)
+            244..245 'd': (u32, i64)
+            258..272 'G::make::<i64>': fn make<G<u32>, u32, i64>() -> (u32, i64)
+            258..274 'G::mak...i64>()': (u32, i64)
+            284..285 'e': (u32, i64)
+            300..307 'G::make': fn make<G<u32>, u32, i64>() -> (u32, i64)
+            300..309 'G::make()': (u32, i64)
+        "#]],
     );
 }
 
 #[test]
 fn infer_trait_assoc_method_generics_3() {
-    assert_snapshot!(
-        infer(r#"
-trait Trait<T> {
-    fn make() -> (Self, T);
-}
-struct S<T>;
-impl Trait<i64> for S<i32> {}
-fn test() {
-    let a = S::make();
-}
-"#),
-        @r###"
-    101..127 '{     ...e(); }': ()
-    111..112 'a': (S<i32>, i64)
-    115..122 'S::make': fn make<S<i32>, i64>() -> (S<i32>, i64)
-    115..124 'S::make()': (S<i32>, i64)
-    "###
+    check_infer(
+        r#"
+        trait Trait<T> {
+            fn make() -> (Self, T);
+        }
+        struct S<T>;
+        impl Trait<i64> for S<i32> {}
+        fn test() {
+            let a = S::make();
+        }
+        "#,
+        expect![[r#"
+            100..126 '{     ...e(); }': ()
+            110..111 'a': (S<i32>, i64)
+            114..121 'S::make': fn make<S<i32>, i64>() -> (S<i32>, i64)
+            114..123 'S::make()': (S<i32>, i64)
+        "#]],
     );
 }
 
 #[test]
 fn infer_trait_assoc_method_generics_4() {
-    assert_snapshot!(
-        infer(r#"
-trait Trait<T> {
-    fn make() -> (Self, T);
-}
-struct S<T>;
-impl Trait<i64> for S<u64> {}
-impl Trait<i32> for S<u32> {}
-fn test() {
-    let a: (S<u64>, _) = S::make();
-    let b: (_, i32) = S::make();
-}
-"#),
-        @r###"
-    131..203 '{     ...e(); }': ()
-    141..142 'a': (S<u64>, i64)
-    158..165 'S::make': fn make<S<u64>, i64>() -> (S<u64>, i64)
-    158..167 'S::make()': (S<u64>, i64)
-    177..178 'b': (S<u32>, i32)
-    191..198 'S::make': fn make<S<u32>, i32>() -> (S<u32>, i32)
-    191..200 'S::make()': (S<u32>, i32)
-    "###
+    check_infer(
+        r#"
+        trait Trait<T> {
+            fn make() -> (Self, T);
+        }
+        struct S<T>;
+        impl Trait<i64> for S<u64> {}
+        impl Trait<i32> for S<u32> {}
+        fn test() {
+            let a: (S<u64>, _) = S::make();
+            let b: (_, i32) = S::make();
+        }
+        "#,
+        expect![[r#"
+            130..202 '{     ...e(); }': ()
+            140..141 'a': (S<u64>, i64)
+            157..164 'S::make': fn make<S<u64>, i64>() -> (S<u64>, i64)
+            157..166 'S::make()': (S<u64>, i64)
+            176..177 'b': (S<u32>, i32)
+            190..197 'S::make': fn make<S<u32>, i32>() -> (S<u32>, i32)
+            190..199 'S::make()': (S<u32>, i32)
+        "#]],
     );
 }
 
 #[test]
 fn infer_trait_assoc_method_generics_5() {
-    assert_snapshot!(
-        infer(r#"
-trait Trait<T> {
-    fn make<U>() -> (Self, T, U);
-}
-struct S<T>;
-impl Trait<i64> for S<u64> {}
-fn test() {
-    let a = <S as Trait<i64>>::make::<u8>();
-    let b: (S<u64>, _, _) = Trait::<i64>::make::<u8>();
-}
-"#),
-        @r###"
-    107..211 '{     ...>(); }': ()
-    117..118 'a': (S<u64>, i64, u8)
-    121..150 '<S as ...::<u8>': fn make<S<u64>, i64, u8>() -> (S<u64>, i64, u8)
-    121..152 '<S as ...<u8>()': (S<u64>, i64, u8)
-    162..163 'b': (S<u64>, i64, u8)
-    182..206 'Trait:...::<u8>': fn make<S<u64>, i64, u8>() -> (S<u64>, i64, u8)
-    182..208 'Trait:...<u8>()': (S<u64>, i64, u8)
-    "###
+    check_infer(
+        r#"
+        trait Trait<T> {
+            fn make<U>() -> (Self, T, U);
+        }
+        struct S<T>;
+        impl Trait<i64> for S<u64> {}
+        fn test() {
+            let a = <S as Trait<i64>>::make::<u8>();
+            let b: (S<u64>, _, _) = Trait::<i64>::make::<u8>();
+        }
+        "#,
+        expect![[r#"
+            106..210 '{     ...>(); }': ()
+            116..117 'a': (S<u64>, i64, u8)
+            120..149 '<S as ...::<u8>': fn make<S<u64>, i64, u8>() -> (S<u64>, i64, u8)
+            120..151 '<S as ...<u8>()': (S<u64>, i64, u8)
+            161..162 'b': (S<u64>, i64, u8)
+            181..205 'Trait:...::<u8>': fn make<S<u64>, i64, u8>() -> (S<u64>, i64, u8)
+            181..207 'Trait:...<u8>()': (S<u64>, i64, u8)
+        "#]],
     );
 }
 
 #[test]
 fn infer_call_trait_method_on_generic_param_1() {
-    assert_snapshot!(
-        infer(r#"
-trait Trait {
-    fn method(&self) -> u32;
-}
-fn test<T: Trait>(t: T) {
-    t.method();
-}
-"#),
-        @r###"
-    30..34 'self': &Self
-    64..65 't': T
-    70..89 '{     ...d(); }': ()
-    76..77 't': T
-    76..86 't.method()': u32
-    "###
+    check_infer(
+        r#"
+        trait Trait {
+            fn method(&self) -> u32;
+        }
+        fn test<T: Trait>(t: T) {
+            t.method();
+        }
+        "#,
+        expect![[r#"
+            29..33 'self': &Self
+            63..64 't': T
+            69..88 '{     ...d(); }': ()
+            75..76 't': T
+            75..85 't.method()': u32
+        "#]],
     );
 }
 
 #[test]
 fn infer_call_trait_method_on_generic_param_2() {
-    assert_snapshot!(
-        infer(r#"
-trait Trait<T> {
-    fn method(&self) -> T;
-}
-fn test<U, T: Trait<U>>(t: T) {
-    t.method();
-}
-"#),
-        @r###"
-    33..37 'self': &Self
-    71..72 't': T
-    77..96 '{     ...d(); }': ()
-    83..84 't': T
-    83..93 't.method()': U
-    "###
+    check_infer(
+        r#"
+        trait Trait<T> {
+            fn method(&self) -> T;
+        }
+        fn test<U, T: Trait<U>>(t: T) {
+            t.method();
+        }
+        "#,
+        expect![[r#"
+            32..36 'self': &Self
+            70..71 't': T
+            76..95 '{     ...d(); }': ()
+            82..83 't': T
+            82..92 't.method()': U
+        "#]],
     );
 }
 
 #[test]
 fn infer_with_multiple_trait_impls() {
-    assert_snapshot!(
-        infer(r#"
-trait Into<T> {
-    fn into(self) -> T;
-}
-struct S;
-impl Into<u32> for S {}
-impl Into<u64> for S {}
-fn test() {
-    let x: u32 = S.into();
-    let y: u64 = S.into();
-    let z = Into::<u64>::into(S);
-}
-"#),
-        @r###"
-    29..33 'self': Self
-    111..202 '{     ...(S); }': ()
-    121..122 'x': u32
-    130..131 'S': S
-    130..138 'S.into()': u32
-    148..149 'y': u64
-    157..158 'S': S
-    157..165 'S.into()': u64
-    175..176 'z': u64
-    179..196 'Into::...::into': fn into<S, u64>(S) -> u64
-    179..199 'Into::...nto(S)': u64
-    197..198 'S': S
-    "###
+    check_infer(
+        r#"
+        trait Into<T> {
+            fn into(self) -> T;
+        }
+        struct S;
+        impl Into<u32> for S {}
+        impl Into<u64> for S {}
+        fn test() {
+            let x: u32 = S.into();
+            let y: u64 = S.into();
+            let z = Into::<u64>::into(S);
+        }
+        "#,
+        expect![[r#"
+            28..32 'self': Self
+            110..201 '{     ...(S); }': ()
+            120..121 'x': u32
+            129..130 'S': S
+            129..137 'S.into()': u32
+            147..148 'y': u64
+            156..157 'S': S
+            156..164 'S.into()': u64
+            174..175 'z': u64
+            178..195 'Into::...::into': fn into<S, u64>(S) -> u64
+            178..198 'Into::...nto(S)': u64
+            196..197 'S': S
+        "#]],
     );
 }
 
 #[test]
 fn method_resolution_unify_impl_self_type() {
-    let t = type_at(
+    check_types(
         r#"
-//- /main.rs
 struct S<T>;
 impl S<u32> { fn foo(&self) -> u8 {} }
 impl S<i32> { fn foo(&self) -> i8 {} }
-fn test() { (S::<u32>.foo(), S::<i32>.foo())<|>; }
+fn test() { (S::<u32>.foo(), S::<i32>.foo()); }
+          //^ (u8, i8)
 "#,
     );
-    assert_eq!(t, "(u8, i8)");
 }
 
 #[test]
 fn method_resolution_trait_before_autoref() {
-    let t = type_at(
+    check_types(
         r#"
-//- /main.rs
 trait Trait { fn foo(self) -> u128; }
 struct S;
 impl S { fn foo(&self) -> i8 { 0 } }
 impl Trait for S { fn foo(self) -> u128 { 0 } }
-fn test() { S.foo()<|>; }
+fn test() { S.foo(); }
+                //^ u128
 "#,
     );
-    assert_eq!(t, "u128");
 }
 
 #[test]
 fn method_resolution_by_value_before_autoref() {
-    let t = type_at(
+    check_types(
         r#"
-//- /main.rs
 trait Clone { fn clone(&self) -> Self; }
 struct S;
 impl Clone for S {}
 impl Clone for &S {}
-fn test() { (S.clone(), (&S).clone(), (&&S).clone())<|>; }
+fn test() { (S.clone(), (&S).clone(), (&&S).clone()); }
+          //^ (S, S, &S)
 "#,
     );
-    assert_eq!(t, "(S, S, &S)");
 }
 
 #[test]
 fn method_resolution_trait_before_autoderef() {
-    let t = type_at(
+    check_types(
         r#"
-//- /main.rs
 trait Trait { fn foo(self) -> u128; }
 struct S;
 impl S { fn foo(self) -> i8 { 0 } }
 impl Trait for &S { fn foo(self) -> u128 { 0 } }
-fn test() { (&S).foo()<|>; }
+fn test() { (&S).foo(); }
+                   //^ u128
 "#,
     );
-    assert_eq!(t, "u128");
 }
 
 #[test]
 fn method_resolution_impl_before_trait() {
-    let t = type_at(
+    check_types(
         r#"
-//- /main.rs
 trait Trait { fn foo(self) -> u128; }
 struct S;
 impl S { fn foo(self) -> i8 { 0 } }
 impl Trait for S { fn foo(self) -> u128 { 0 } }
-fn test() { S.foo()<|>; }
+fn test() { S.foo(); }
+                //^ i8
 "#,
     );
-    assert_eq!(t, "i8");
 }
 
 #[test]
 fn method_resolution_impl_ref_before_trait() {
-    let t = type_at(
+    check_types(
         r#"
-//- /main.rs
 trait Trait { fn foo(self) -> u128; }
 struct S;
 impl S { fn foo(&self) -> i8 { 0 } }
 impl Trait for &S { fn foo(self) -> u128 { 0 } }
-fn test() { S.foo()<|>; }
+fn test() { S.foo(); }
+                //^ i8
 "#,
     );
-    assert_eq!(t, "i8");
 }
 
 #[test]
 fn method_resolution_trait_autoderef() {
-    let t = type_at(
+    check_types(
         r#"
-//- /main.rs
 trait Trait { fn foo(self) -> u128; }
 struct S;
 impl Trait for S { fn foo(self) -> u128 { 0 } }
-fn test() { (&S).foo()<|>; }
+fn test() { (&S).foo(); }
+                   //^ u128
 "#,
     );
-    assert_eq!(t, "u128");
 }
 
 #[test]
 fn method_resolution_unsize_array() {
-    let t = type_at(
+    check_types(
         r#"
-//- /main.rs
 #[lang = "slice"]
 impl<T> [T] {
     fn len(&self) -> usize { loop {} }
 }
 fn test() {
     let a = [1, 2, 3];
-    a.len()<|>;
-}
+    a.len();
+}       //^ usize
 "#,
     );
-    assert_eq!(t, "usize");
 }
 
 #[test]
 fn method_resolution_trait_from_prelude() {
-    let (db, pos) = TestDB::with_position(
+    check_types(
         r#"
 //- /main.rs crate:main deps:other_crate
 struct S;
 impl Clone for S {}
 
 fn test() {
-    S.clone()<|>;
+    S.clone();
+          //^ S
 }
 
 //- /lib.rs crate:other_crate
@@ -879,115 +815,107 @@ mod foo {
 }
 "#,
     );
-    assert_eq!("S", type_at_pos(&db, pos));
 }
 
 #[test]
 fn method_resolution_where_clause_for_unknown_trait() {
     // The blanket impl currently applies because we ignore the unresolved where clause
-    let t = type_at(
+    check_types(
         r#"
-//- /main.rs
 trait Trait { fn foo(self) -> u128; }
 struct S;
 impl<T> Trait for T where T: UnknownTrait {}
-fn test() { (&S).foo()<|>; }
+fn test() { (&S).foo(); }
+                   //^ u128
 "#,
     );
-    assert_eq!(t, "u128");
 }
 
 #[test]
 fn method_resolution_where_clause_not_met() {
     // The blanket impl shouldn't apply because we can't prove S: Clone
-    let t = type_at(
+    // This is also to make sure that we don't resolve to the foo method just
+    // because that's the only method named foo we can find, which would make
+    // the below tests not work
+    check_types(
         r#"
-//- /main.rs
 trait Clone {}
 trait Trait { fn foo(self) -> u128; }
 struct S;
 impl<T> Trait for T where T: Clone {}
-fn test() { (&S).foo()<|>; }
+fn test() { (&S).foo(); }
+                   //^ {unknown}
 "#,
     );
-    // This is also to make sure that we don't resolve to the foo method just
-    // because that's the only method named foo we can find, which would make
-    // the below tests not work
-    assert_eq!(t, "{unknown}");
 }
 
 #[test]
 fn method_resolution_where_clause_inline_not_met() {
     // The blanket impl shouldn't apply because we can't prove S: Clone
-    let t = type_at(
+    check_types(
         r#"
-//- /main.rs
 trait Clone {}
 trait Trait { fn foo(self) -> u128; }
 struct S;
 impl<T: Clone> Trait for T {}
-fn test() { (&S).foo()<|>; }
+fn test() { (&S).foo(); }
+                   //^ {unknown}
 "#,
     );
-    assert_eq!(t, "{unknown}");
 }
 
 #[test]
 fn method_resolution_where_clause_1() {
-    let t = type_at(
+    check_types(
         r#"
-//- /main.rs
 trait Clone {}
 trait Trait { fn foo(self) -> u128; }
 struct S;
 impl Clone for S {}
 impl<T> Trait for T where T: Clone {}
-fn test() { S.foo()<|>; }
+fn test() { S.foo(); }
+                //^ u128
 "#,
     );
-    assert_eq!(t, "u128");
 }
 
 #[test]
 fn method_resolution_where_clause_2() {
-    let t = type_at(
+    check_types(
         r#"
-//- /main.rs
 trait Into<T> { fn into(self) -> T; }
 trait From<T> { fn from(other: T) -> Self; }
 struct S1;
 struct S2;
 impl From<S2> for S1 {}
 impl<T, U> Into<U> for T where U: From<T> {}
-fn test() { S2.into()<|>; }
+fn test() { S2.into(); }
+                  //^ {unknown}
 "#,
     );
-    assert_eq!(t, "{unknown}");
 }
 
 #[test]
 fn method_resolution_where_clause_inline() {
-    let t = type_at(
+    check_types(
         r#"
-//- /main.rs
 trait Into<T> { fn into(self) -> T; }
 trait From<T> { fn from(other: T) -> Self; }
 struct S1;
 struct S2;
 impl From<S2> for S1 {}
 impl<T, U: From<T>> Into<U> for T {}
-fn test() { S2.into()<|>; }
+fn test() { S2.into(); }
+                  //^ {unknown}
 "#,
     );
-    assert_eq!(t, "{unknown}");
 }
 
 #[test]
 fn method_resolution_overloaded_method() {
     test_utils::mark::check!(impl_self_type_match_without_receiver);
-    let t = type_at(
+    check_types(
         r#"
-//- main.rs
 struct Wrapper<T>(T);
 struct Foo<T>(T);
 struct Bar<T>(T);
@@ -1007,30 +935,30 @@ impl<T> Wrapper<Bar<T>> {
 fn main() {
     let a = Wrapper::<Foo<f32>>::new(1.0);
     let b = Wrapper::<Bar<f32>>::new(1.0);
-    (a, b)<|>;
+    (a, b);
+  //^ (Wrapper<Foo<f32>>, Wrapper<Bar<f32>>)
 }
 "#,
     );
-    assert_eq!(t, "(Wrapper<Foo<f32>>, Wrapper<Bar<f32>>)")
 }
 
 #[test]
 fn method_resolution_encountering_fn_type() {
-    type_at(
+    check_types(
         r#"
 //- /main.rs
 fn foo() {}
 trait FnOnce { fn call(self); }
-fn test() { foo.call()<|>; }
+fn test() { foo.call(); }
+                   //^ {unknown}
 "#,
     );
 }
 
 #[test]
 fn method_resolution_non_parameter_type() {
-    let t = type_at(
+    check_types(
         r#"
-//- /main.rs
 mod a {
     pub trait Foo {
         fn foo(&self);
@@ -1042,18 +970,16 @@ fn foo<T>(t: Wrapper<T>)
 where
     Wrapper<T>: a::Foo,
 {
-    t.foo()<|>;
-}
+    t.foo();
+}       //^ {unknown}
 "#,
     );
-    assert_eq!(t, "{unknown}");
 }
 
 #[test]
 fn method_resolution_3373() {
-    let t = type_at(
+    check_types(
         r#"
-//- /main.rs
 struct A<T>(T);
 
 impl A<i32> {
@@ -1061,19 +987,17 @@ impl A<i32> {
 }
 
 fn main() {
-    A::from(3)<|>;
-}
+    A::from(3);
+}          //^ A<i32>
 "#,
     );
-    assert_eq!(t, "A<i32>");
 }
 
 #[test]
 fn method_resolution_slow() {
     // this can get quite slow if we set the solver size limit too high
-    let t = type_at(
+    check_types(
         r#"
-//- /main.rs
 trait SendX {}
 
 struct S1; impl SendX for S1 {}
@@ -1091,39 +1015,39 @@ trait FnX {}
 
 impl<B, C> Trait for S<B, C> where C: FnX, B: SendX {}
 
-fn test() { (S {}).method()<|>; }
+fn test() { (S {}).method(); }
+                        //^ ()
 "#,
     );
-    assert_eq!(t, "()");
 }
 
 #[test]
 fn dyn_trait_super_trait_not_in_scope() {
-    assert_snapshot!(
-        infer(r#"
-mod m {
-    pub trait SuperTrait {
-        fn foo(&self) -> u32 { 0 }
-    }
-}
-trait Trait: m::SuperTrait {}
+    check_infer(
+        r#"
+        mod m {
+            pub trait SuperTrait {
+                fn foo(&self) -> u32 { 0 }
+            }
+        }
+        trait Trait: m::SuperTrait {}
 
-struct S;
-impl m::SuperTrait for S {}
-impl Trait for S {}
+        struct S;
+        impl m::SuperTrait for S {}
+        impl Trait for S {}
 
-fn test(d: &dyn Trait) {
-    d.foo();
-}
-"#),
-        @r###"
-    52..56 'self': &Self
-    65..70 '{ 0 }': u32
-    67..68 '0': u32
-    177..178 'd': &dyn Trait
-    192..208 '{     ...o(); }': ()
-    198..199 'd': &dyn Trait
-    198..205 'd.foo()': u32
-    "###
+        fn test(d: &dyn Trait) {
+            d.foo();
+        }
+        "#,
+        expect![[r#"
+            51..55 'self': &Self
+            64..69 '{ 0 }': u32
+            66..67 '0': u32
+            176..177 'd': &dyn Trait
+            191..207 '{     ...o(); }': ()
+            197..198 'd': &dyn Trait
+            197..204 'd.foo()': u32
+        "#]],
     );
 }

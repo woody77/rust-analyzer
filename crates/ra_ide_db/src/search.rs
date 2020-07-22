@@ -157,14 +157,14 @@ impl Definition {
         if let Some(Visibility::Public) = vis {
             let source_root_id = db.file_source_root(file_id);
             let source_root = db.source_root(source_root_id);
-            let mut res = source_root.walk().map(|id| (id, None)).collect::<FxHashMap<_, _>>();
+            let mut res = source_root.iter().map(|id| (id, None)).collect::<FxHashMap<_, _>>();
 
             let krate = module.krate();
             for rev_dep in krate.reverse_dependencies(db) {
                 let root_file = rev_dep.root_file(db);
                 let source_root_id = db.file_source_root(root_file);
                 let source_root = db.source_root(source_root_id);
-                res.extend(source_root.walk().map(|id| (id, None)));
+                res.extend(source_root.iter().map(|id| (id, None)));
             }
             return SearchScope::new(res);
         }
@@ -180,20 +180,20 @@ impl Definition {
 
     pub fn find_usages(
         &self,
-        db: &RootDatabase,
+        sema: &Semantics<RootDatabase>,
         search_scope: Option<SearchScope>,
     ) -> Vec<Reference> {
         let _p = profile("Definition::find_usages");
 
         let search_scope = {
-            let base = self.search_scope(db);
+            let base = self.search_scope(sema.db);
             match search_scope {
                 None => base,
                 Some(scope) => base.intersection(&scope),
             }
         };
 
-        let name = match self.name(db) {
+        let name = match self.name(sema.db) {
             None => return Vec::new(),
             Some(it) => it.to_string(),
         };
@@ -202,11 +202,10 @@ impl Definition {
         let mut refs = vec![];
 
         for (file_id, search_range) in search_scope {
-            let text = db.file_text(file_id);
+            let text = sema.db.file_text(file_id);
             let search_range =
                 search_range.unwrap_or(TextRange::up_to(TextSize::of(text.as_str())));
 
-            let sema = Semantics::new(db);
             let tree = Lazy::new(|| sema.parse(file_id).syntax().clone());
 
             for (idx, _) in text.match_indices(pat) {
@@ -221,9 +220,6 @@ impl Definition {
                     } else {
                         continue;
                     };
-
-                // FIXME: reuse sb
-                // See https://github.com/rust-lang/rust/pull/68198#issuecomment-574269098
 
                 match classify_name_ref(&sema, &name_ref) {
                     Some(NameRefClass::Definition(def)) if &def == self => {

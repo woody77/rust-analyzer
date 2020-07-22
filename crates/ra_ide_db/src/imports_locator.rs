@@ -1,7 +1,7 @@
 //! This module contains an import search funcionality that is provided to the ra_assists module.
 //! Later, this should be moved away to a separate crate that is accessible from the ra_assists module.
 
-use hir::{MacroDef, ModuleDef, Semantics};
+use hir::{Crate, MacroDef, ModuleDef, Semantics};
 use ra_prof::profile;
 use ra_syntax::{ast, AstNode, SyntaxKind::NAME};
 
@@ -11,57 +11,55 @@ use crate::{
     RootDatabase,
 };
 use either::Either;
+use rustc_hash::FxHashSet;
 
-pub struct ImportsLocator<'a> {
-    sema: Semantics<'a, RootDatabase>,
-}
+pub fn find_imports<'a>(
+    sema: &Semantics<'a, RootDatabase>,
+    krate: Crate,
+    name_to_import: &str,
+) -> Vec<Either<ModuleDef, MacroDef>> {
+    let _p = profile("search_for_imports");
+    let db = sema.db;
 
-impl<'a> ImportsLocator<'a> {
-    pub fn new(db: &'a RootDatabase) -> Self {
-        Self { sema: Semantics::new(db) }
-    }
+    // Query dependencies first.
+    let mut candidates: FxHashSet<_> =
+        krate.query_external_importables(db, name_to_import).collect();
 
-    pub fn find_imports(&mut self, name_to_import: &str) -> Vec<Either<ModuleDef, MacroDef>> {
-        let _p = profile("search_for_imports");
-        let db = self.sema.db;
+    // Query the local crate using the symbol index.
+    let local_results = {
+        let mut query = Query::new(name_to_import.to_string());
+        query.exact();
+        query.limit(40);
+        symbol_index::crate_symbols(db, krate.into(), query)
+    };
 
-        let project_results = {
-            let mut query = Query::new(name_to_import.to_string());
-            query.exact();
-            query.limit(40);
-            symbol_index::world_symbols(db, query)
-        };
-        let lib_results = {
-            let mut query = Query::new(name_to_import.to_string());
-            query.libs();
-            query.exact();
-            query.limit(40);
-            symbol_index::world_symbols(db, query)
-        };
-
-        project_results
+    candidates.extend(
+        local_results
             .into_iter()
-            .chain(lib_results.into_iter())
-            .filter_map(|import_candidate| self.get_name_definition(&import_candidate))
+            .filter_map(|import_candidate| get_name_definition(sema, &import_candidate))
             .filter_map(|name_definition_to_import| match name_definition_to_import {
                 Definition::ModuleDef(module_def) => Some(Either::Left(module_def)),
                 Definition::Macro(macro_def) => Some(Either::Right(macro_def)),
                 _ => None,
-            })
-            .collect()
-    }
+            }),
+    );
 
-    fn get_name_definition(&mut self, import_candidate: &FileSymbol) -> Option<Definition> {
-        let _p = profile("get_name_definition");
-        let file_id = import_candidate.file_id;
+    candidates.into_iter().collect()
+}
 
-        let candidate_node = import_candidate.ptr.to_node(self.sema.parse(file_id).syntax());
-        let candidate_name_node = if candidate_node.kind() != NAME {
-            candidate_node.children().find(|it| it.kind() == NAME)?
-        } else {
-            candidate_node
-        };
-        let name = ast::Name::cast(candidate_name_node)?;
-        classify_name(&self.sema, &name)?.into_definition()
-    }
+fn get_name_definition<'a>(
+    sema: &Semantics<'a, RootDatabase>,
+    import_candidate: &FileSymbol,
+) -> Option<Definition> {
+    let _p = profile("get_name_definition");
+    let file_id = import_candidate.file_id;
+
+    let candidate_node = import_candidate.ptr.to_node(sema.parse(file_id).syntax());
+    let candidate_name_node = if candidate_node.kind() != NAME {
+        candidate_node.children().find(|it| it.kind() == NAME)?
+    } else {
+        candidate_node
+    };
+    let name = ast::Name::cast(candidate_name_node)?;
+    classify_name(sema, &name)?.into_definition()
 }

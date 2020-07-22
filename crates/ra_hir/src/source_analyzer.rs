@@ -14,11 +14,11 @@ use hir_def::{
     },
     expr::{ExprId, Pat, PatId},
     resolver::{resolver_for_scope, Resolver, TypeNs, ValueNs},
-    AsMacroCall, DefWithBodyId, FieldId, LocalFieldId, VariantId,
+    AsMacroCall, DefWithBodyId, FieldId, FunctionId, LocalFieldId, VariantId,
 };
 use hir_expand::{hygiene::Hygiene, name::AsName, HirFileId, InFile};
 use hir_ty::{
-    expr::{record_literal_missing_fields, record_pattern_missing_fields},
+    diagnostics::{record_literal_missing_fields, record_pattern_missing_fields},
     InferenceResult, Substs, Ty,
 };
 use ra_syntax::{
@@ -115,7 +115,7 @@ impl SourceAnalyzer {
         Some(res)
     }
 
-    pub(crate) fn type_of(&self, db: &dyn HirDatabase, expr: &ast::Expr) -> Option<Type> {
+    pub(crate) fn type_of_expr(&self, db: &dyn HirDatabase, expr: &ast::Expr) -> Option<Type> {
         let expr_id = self.expr_id(db, expr)?;
         let ty = self.infer.as_ref()?[expr_id].clone();
         Type::new_with_resolver(db, &self.resolver, ty)
@@ -127,13 +127,24 @@ impl SourceAnalyzer {
         Type::new_with_resolver(db, &self.resolver, ty)
     }
 
+    pub(crate) fn type_of_self(
+        &self,
+        db: &dyn HirDatabase,
+        param: &ast::SelfParam,
+    ) -> Option<Type> {
+        let src = InFile { file_id: self.file_id, value: param };
+        let pat_id = self.body_source_map.as_ref()?.node_self_param(src)?;
+        let ty = self.infer.as_ref()?[pat_id].clone();
+        Type::new_with_resolver(db, &self.resolver, ty)
+    }
+
     pub(crate) fn resolve_method_call(
         &self,
         db: &dyn HirDatabase,
         call: &ast::MethodCallExpr,
-    ) -> Option<Function> {
+    ) -> Option<FunctionId> {
         let expr_id = self.expr_id(db, &call.clone().into())?;
-        self.infer.as_ref()?.method_resolution(expr_id).map(Function::from)
+        self.infer.as_ref()?.method_resolution(expr_id)
     }
 
     pub(crate) fn resolve_field(
@@ -216,13 +227,43 @@ impl SourceAnalyzer {
             if let Some(assoc) = self.infer.as_ref()?.assoc_resolutions_for_expr(expr_id) {
                 return Some(PathResolution::AssocItem(assoc.into()));
             }
+            if let Some(VariantId::EnumVariantId(variant)) =
+                self.infer.as_ref()?.variant_resolution_for_expr(expr_id)
+            {
+                return Some(PathResolution::Def(ModuleDef::EnumVariant(variant.into())));
+            }
         }
+
         if let Some(path_pat) = path.syntax().parent().and_then(ast::PathPat::cast) {
             let pat_id = self.pat_id(&path_pat.into())?;
             if let Some(assoc) = self.infer.as_ref()?.assoc_resolutions_for_pat(pat_id) {
                 return Some(PathResolution::AssocItem(assoc.into()));
             }
+            if let Some(VariantId::EnumVariantId(variant)) =
+                self.infer.as_ref()?.variant_resolution_for_pat(pat_id)
+            {
+                return Some(PathResolution::Def(ModuleDef::EnumVariant(variant.into())));
+            }
         }
+
+        if let Some(rec_lit) = path.syntax().parent().and_then(ast::RecordLit::cast) {
+            let expr_id = self.expr_id(db, &rec_lit.into())?;
+            if let Some(VariantId::EnumVariantId(variant)) =
+                self.infer.as_ref()?.variant_resolution_for_expr(expr_id)
+            {
+                return Some(PathResolution::Def(ModuleDef::EnumVariant(variant.into())));
+            }
+        }
+
+        if let Some(rec_pat) = path.syntax().parent().and_then(ast::RecordPat::cast) {
+            let pat_id = self.pat_id(&rec_pat.into())?;
+            if let Some(VariantId::EnumVariantId(variant)) =
+                self.infer.as_ref()?.variant_resolution_for_pat(pat_id)
+            {
+                return Some(PathResolution::Def(ModuleDef::EnumVariant(variant.into())));
+            }
+        }
+
         // This must be a normal source file rather than macro file.
         let hir_path =
             crate::Path::from_src(path.clone(), &Hygiene::new(db.upcast(), self.file_id))?;
@@ -307,10 +348,21 @@ impl SourceAnalyzer {
         db: &dyn HirDatabase,
         macro_call: InFile<&ast::MacroCall>,
     ) -> Option<HirFileId> {
-        let macro_call_id = macro_call.as_call_id(db.upcast(), |path| {
+        let krate = self.resolver.krate()?;
+        let macro_call_id = macro_call.as_call_id(db.upcast(), krate, |path| {
             self.resolver.resolve_path_as_macro(db.upcast(), &path)
         })?;
-        Some(macro_call_id.as_file())
+        Some(macro_call_id.as_file()).filter(|it| it.expansion_level(db.upcast()) < 64)
+    }
+
+    pub(crate) fn resolve_variant(
+        &self,
+        db: &dyn HirDatabase,
+        record_lit: ast::RecordLit,
+    ) -> Option<VariantId> {
+        let infer = self.infer.as_ref()?;
+        let expr_id = self.expr_id(db, &record_lit.into())?;
+        infer.variant_resolution_for_expr(expr_id)
     }
 }
 

@@ -54,7 +54,8 @@ pub mod fs2 {
     }
 }
 
-macro_rules! _run {
+#[macro_export]
+macro_rules! run {
     ($($expr:expr),*) => {
         run!($($expr),*; echo = true)
     };
@@ -65,7 +66,7 @@ macro_rules! _run {
         $crate::not_bash::run_process(format!($($expr),*), false, Some($stdin))
     };
 }
-pub(crate) use _run as run;
+pub use crate::run;
 
 pub struct Pushd {
     _p: (),
@@ -153,7 +154,17 @@ fn run_process_inner(cmd: &str, echo: bool, stdin: Option<&[u8]>) -> Result<Stri
 
 // FIXME: some real shell lexing here
 fn shelx(cmd: &str) -> Vec<String> {
-    cmd.split_whitespace().map(|it| it.to_string()).collect()
+    let mut res = Vec::new();
+    for (string_piece, in_quotes) in cmd.split('\'').zip([false, true].iter().copied().cycle()) {
+        if in_quotes {
+            res.push(string_piece.to_string())
+        } else {
+            if !string_piece.is_empty() {
+                res.extend(string_piece.split_ascii_whitespace().map(|it| it.to_string()))
+            }
+        }
+    }
+    res
 }
 
 struct Env {

@@ -1,7 +1,7 @@
 //! Defines database & queries for name resolution.
 use std::sync::Arc;
 
-use hir_expand::{db::AstDatabase, name::Name, HirFileId};
+use hir_expand::{db::AstDatabase, HirFileId};
 use ra_db::{salsa, CrateId, SourceDatabase, Upcast};
 use ra_prof::profile;
 use ra_syntax::SmolStr;
@@ -12,13 +12,11 @@ use crate::{
     body::{scope::ExprScopes, Body, BodySourceMap},
     data::{ConstData, FunctionData, ImplData, StaticData, TraitData, TypeAliasData},
     docs::Documentation,
-    find_path,
     generics::GenericParams,
-    item_scope::ItemInNs,
+    import_map::ImportMap,
+    item_tree::ItemTree,
     lang_item::{LangItemTarget, LangItems},
-    nameres::{raw::RawItems, CrateDefMap},
-    path::ModPath,
-    visibility::Visibility,
+    nameres::CrateDefMap,
     AttrDefId, ConstId, ConstLoc, DefWithBodyId, EnumId, EnumLoc, FunctionId, FunctionLoc,
     GenericDefId, ImplId, ImplLoc, ModuleId, StaticId, StaticLoc, StructId, StructLoc, TraitId,
     TraitLoc, TypeAliasId, TypeAliasLoc, UnionId, UnionLoc,
@@ -48,8 +46,8 @@ pub trait InternDatabase: SourceDatabase {
 
 #[salsa::query_group(DefDatabaseStorage)]
 pub trait DefDatabase: InternDatabase + AstDatabase + Upcast<dyn AstDatabase> {
-    #[salsa::invoke(RawItems::raw_items_query)]
-    fn raw_items(&self, file_id: HirFileId) -> Arc<RawItems>;
+    #[salsa::invoke(ItemTree::item_tree_query)]
+    fn item_tree(&self, file_id: HirFileId) -> Arc<ItemTree>;
 
     #[salsa::invoke(crate_def_map_wait)]
     #[salsa::transparent]
@@ -113,15 +111,8 @@ pub trait DefDatabase: InternDatabase + AstDatabase + Upcast<dyn AstDatabase> {
     #[salsa::invoke(Documentation::documentation_query)]
     fn documentation(&self, def: AttrDefId) -> Option<Documentation>;
 
-    #[salsa::invoke(find_path::importable_locations_of_query)]
-    fn importable_locations_of(
-        &self,
-        item: ItemInNs,
-        krate: CrateId,
-    ) -> Arc<[(ModuleId, Name, Visibility)]>;
-
-    #[salsa::invoke(find_path::find_path_inner_query)]
-    fn find_path_inner(&self, item: ItemInNs, from: ModuleId, max_len: usize) -> Option<ModPath>;
+    #[salsa::invoke(ImportMap::import_map_query)]
+    fn import_map(&self, krate: CrateId) -> Arc<ImportMap>;
 }
 
 fn crate_def_map_wait(db: &impl DefDatabase, krate: CrateId) -> Arc<CrateDefMap> {

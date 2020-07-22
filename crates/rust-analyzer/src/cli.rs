@@ -5,11 +5,12 @@ mod analysis_stats;
 mod analysis_bench;
 mod diagnostics;
 mod progress_report;
+mod ssr;
 
 use std::io::Read;
 
 use anyhow::Result;
-use ra_ide::{file_structure, Analysis};
+use ra_ide::Analysis;
 use ra_prof::profile;
 use ra_syntax::{AstNode, SourceFile};
 
@@ -17,6 +18,7 @@ pub use analysis_bench::{analysis_bench, BenchWhat, Position};
 pub use analysis_stats::analysis_stats;
 pub use diagnostics::diagnostics;
 pub use load_cargo::load_cargo;
+pub use ssr::{apply_ssr_rules, search_for_patterns};
 
 #[derive(Clone, Copy)]
 pub enum Verbosity {
@@ -28,16 +30,10 @@ pub enum Verbosity {
 
 impl Verbosity {
     pub fn is_verbose(self) -> bool {
-        match self {
-            Verbosity::Verbose | Verbosity::Spammy => true,
-            _ => false,
-        }
+        matches!(self, Verbosity::Verbose | Verbosity::Spammy)
     }
     pub fn is_spammy(self) -> bool {
-        match self {
-            Verbosity::Spammy => true,
-            _ => false,
-        }
+        matches!(self, Verbosity::Spammy)
     }
 }
 
@@ -52,8 +48,10 @@ pub fn parse(no_dump: bool) -> Result<()> {
 }
 
 pub fn symbols() -> Result<()> {
-    let file = file()?;
-    for s in file_structure(&file) {
+    let text = read_stdin()?;
+    let (analysis, file_id) = Analysis::from_single_file(text);
+    let structure = analysis.file_structure(file_id).unwrap();
+    for s in structure {
         println!("{:?}", s);
     }
     Ok(())

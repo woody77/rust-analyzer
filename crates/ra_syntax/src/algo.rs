@@ -41,6 +41,10 @@ pub fn find_node_at_offset<N: AstNode>(syntax: &SyntaxNode, offset: TextSize) ->
     ancestors_at_offset(syntax, offset).find_map(N::cast)
 }
 
+pub fn find_node_at_range<N: AstNode>(syntax: &SyntaxNode, range: TextRange) -> Option<N> {
+    find_covering_element(syntax, range).ancestors().find_map(N::cast)
+}
+
 /// Skip to next non `trivia` token
 pub fn skip_trivia_token(mut token: SyntaxToken, direction: Direction) -> Option<SyntaxToken> {
     while token.kind().is_trivia() {
@@ -290,6 +294,11 @@ impl<'a> SyntaxRewriter<'a> {
         N::cast(self.rewrite(node.syntax())).unwrap()
     }
 
+    /// Returns a node that encompasses all replacements to be done by this rewriter.
+    ///
+    /// Passing the returned node to `rewrite` will apply all replacements queued up in `self`.
+    ///
+    /// Returns `None` when there are no replacements.
     pub fn rewrite_root(&self) -> Option<SyntaxNode> {
         assert!(self.f.is_none());
         self.replacements
@@ -298,6 +307,9 @@ impl<'a> SyntaxRewriter<'a> {
                 SyntaxElement::Node(it) => it.clone(),
                 SyntaxElement::Token(it) => it.parent(),
             })
+            // If we only have one replacement, we must return its parent node, since `rewrite` does
+            // not replace the node passed to it.
+            .map(|it| it.parent().unwrap_or(it))
             .fold1(|a, b| least_common_ancestor(&a, &b).unwrap())
     }
 

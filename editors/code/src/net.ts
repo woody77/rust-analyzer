@@ -1,8 +1,14 @@
-import fetch from "node-fetch";
+// Replace with `import fetch from "node-fetch"` once this is fixed in rollup:
+// https://github.com/rollup/plugins/issues/491
+const fetch = require("node-fetch") as typeof import("node-fetch")["default"];
+
 import * as vscode from "vscode";
-import * as fs from "fs";
 import * as stream from "stream";
+import * as crypto from "crypto";
+import * as fs from "fs";
+import * as zlib from "zlib";
 import * as util from "util";
+import * as path from "path";
 import { log, assert } from "./util";
 
 const pipeline = util.promisify(stream.pipeline);
@@ -58,22 +64,30 @@ export interface GithubRelease {
     }>;
 }
 
+interface DownloadOpts {
+    progressTitle: string;
+    url: string;
+    dest: string;
+    mode?: number;
+    gunzip?: boolean;
+}
 
-export async function download(
-    downloadUrl: string,
-    destinationPath: string,
-    progressTitle: string,
-    { mode }: { mode?: number } = {},
-) {
+export async function download(opts: DownloadOpts) {
+    // Put artifact into a temporary file (in the same dir for simplicity)
+    // to prevent partially downloaded files when user kills vscode
+    const dest = path.parse(opts.dest);
+    const randomHex = crypto.randomBytes(5).toString("hex");
+    const tempFile = path.join(dest.dir, `${dest.name}${randomHex}`);
+
     await vscode.window.withProgress(
         {
             location: vscode.ProgressLocation.Notification,
             cancellable: false,
-            title: progressTitle
+            title: opts.progressTitle
         },
         async (progress, _cancellationToken) => {
             let lastPercentage = 0;
-            await downloadFile(downloadUrl, destinationPath, mode, (readBytes, totalBytes) => {
+            await downloadFile(opts.url, tempFile, opts.mode, !!opts.gunzip, (readBytes, totalBytes) => {
                 const newPercentage = (readBytes / totalBytes) * 100;
                 progress.report({
                     message: newPercentage.toFixed(0) + "%",
@@ -84,18 +98,15 @@ export async function download(
             });
         }
     );
+
+    await fs.promises.rename(tempFile, opts.dest);
 }
 
-/**
- * Downloads file from `url` and stores it at `destFilePath` with `destFilePermissions`.
- * `onProgress` callback is called on recieveing each chunk of bytes
- * to track the progress of downloading, it gets the already read and total
- * amount of bytes to read as its parameters.
- */
 async function downloadFile(
     url: string,
     destFilePath: fs.PathLike,
     mode: number | undefined,
+    gunzip: boolean,
     onProgress: (readBytes: number, totalBytes: number) => void
 ): Promise<void> {
     const res = await fetch(url);
@@ -119,13 +130,14 @@ async function downloadFile(
     });
 
     const destFileStream = fs.createWriteStream(destFilePath, { mode });
+    const srcStream = gunzip ? res.body.pipe(zlib.createGunzip()) : res.body;
 
-    await pipeline(res.body, destFileStream);
-    return new Promise<void>(resolve => {
+    await pipeline(srcStream, destFileStream);
+
+    await new Promise<void>(resolve => {
         destFileStream.on("close", resolve);
         destFileStream.destroy();
-
-        // Details on workaround: https://github.com/rust-analyzer/rust-analyzer/pull/3092#discussion_r378191131
-        // Issue at nodejs repo: https://github.com/nodejs/node/issues/31776
+        // This workaround is awaiting to be removed when vscode moves to newer nodejs version:
+        // https://github.com/rust-analyzer/rust-analyzer/issues/3167
     });
 }

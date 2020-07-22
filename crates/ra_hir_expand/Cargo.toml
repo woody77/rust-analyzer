@@ -3,6 +3,7 @@ edition = "2018"
 name = "ra_hir_expand"
 version = "0.1.0"
 authors = ["rust-analyzer developers"]
+license = "MIT OR Apache-2.0"
 
 [lib]
 doctest = false
@@ -10,6 +11,7 @@ doctest = false
 [dependencies]
 log = "0.4.8"
 either = "1.5.3"
+rustc-hash = "1.0.0"
 
 ra_arena = { path = "../ra_arena" }
 ra_db = { path = "../ra_db" }

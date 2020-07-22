@@ -8,20 +8,20 @@ use std::cell::RefCell;
 
 use hir::{
     diagnostics::{AstDiagnostic, Diagnostic as _, DiagnosticSink},
-    Semantics,
+    HasSource, HirDisplay, Semantics, VariantDef,
 };
 use itertools::Itertools;
-use ra_db::{RelativePath, SourceDatabase, SourceDatabaseExt};
+use ra_db::SourceDatabase;
 use ra_ide_db::RootDatabase;
 use ra_prof::profile;
 use ra_syntax::{
     algo,
-    ast::{self, make, AstNode},
+    ast::{self, edit::IndentLevel, make, AstNode},
     SyntaxNode, TextRange, T,
 };
 use ra_text_edit::{TextEdit, TextEditBuilder};
 
-use crate::{Diagnostic, FileId, FileSystemEdit, Fix, SourceChange, SourceFileEdit};
+use crate::{Diagnostic, FileId, FileSystemEdit, Fix, SourceFileEdit};
 
 #[derive(Debug, Copy, Clone)]
 pub enum Severity {
@@ -35,7 +35,8 @@ pub(crate) fn diagnostics(db: &RootDatabase, file_id: FileId) -> Vec<Diagnostic>
     let parse = db.parse(file_id);
     let mut res = Vec::new();
 
-    res.extend(parse.errors().iter().map(|err| Diagnostic {
+    // [#34344] Only take first 128 errors to prevent slowing down editor/ide, the number 128 is chosen arbitrarily.
+    res.extend(parse.errors().iter().take(128).map(|err| Diagnostic {
         range: err.range(),
         message: format!("Syntax Error: {}", err),
         severity: Severity::Error,
@@ -57,14 +58,10 @@ pub(crate) fn diagnostics(db: &RootDatabase, file_id: FileId) -> Vec<Diagnostic>
     })
     .on::<hir::diagnostics::UnresolvedModule, _>(|d| {
         let original_file = d.source().file_id.original_file(db);
-        let source_root = db.file_source_root(original_file);
-        let path = db
-            .file_relative_path(original_file)
-            .parent()
-            .unwrap_or_else(|| RelativePath::new(""))
-            .join(&d.candidate);
-        let fix =
-            Fix::new("Create module", FileSystemEdit::CreateFile { source_root, path }.into());
+        let fix = Fix::new(
+            "Create module",
+            FileSystemEdit::CreateFile { anchor: original_file, dst: d.candidate.clone() }.into(),
+        );
         res.borrow_mut().push(Diagnostic {
             range: sema.diagnostics_range(d).range,
             message: d.message(),
@@ -103,19 +100,11 @@ pub(crate) fn diagnostics(db: &RootDatabase, file_id: FileId) -> Vec<Diagnostic>
             fix,
         })
     })
-    .on::<hir::diagnostics::MissingMatchArms, _>(|d| {
-        res.borrow_mut().push(Diagnostic {
-            range: sema.diagnostics_range(d).range,
-            message: d.message(),
-            severity: Severity::Error,
-            fix: None,
-        })
-    })
     .on::<hir::diagnostics::MissingOkInTailExpr, _>(|d| {
         let node = d.ast(db);
         let replacement = format!("Ok({})", node.syntax());
         let edit = TextEdit::replace(node.syntax().text_range(), replacement);
-        let source_change = SourceChange::source_file_edit_from(file_id, edit);
+        let source_change = SourceFileEdit { file_id, edit }.into();
         let fix = Fix::new("Wrap with ok", source_change);
         res.borrow_mut().push(Diagnostic {
             range: sema.diagnostics_range(d).range,
@@ -123,12 +112,95 @@ pub(crate) fn diagnostics(db: &RootDatabase, file_id: FileId) -> Vec<Diagnostic>
             severity: Severity::Error,
             fix: Some(fix),
         })
+    })
+    .on::<hir::diagnostics::NoSuchField, _>(|d| {
+        res.borrow_mut().push(Diagnostic {
+            range: sema.diagnostics_range(d).range,
+            message: d.message(),
+            severity: Severity::Error,
+            fix: missing_struct_field_fix(&sema, file_id, d),
+        })
     });
+
     if let Some(m) = sema.to_module_def(file_id) {
         m.diagnostics(db, &mut sink);
     };
     drop(sink);
     res.into_inner()
+}
+
+fn missing_struct_field_fix(
+    sema: &Semantics<RootDatabase>,
+    usage_file_id: FileId,
+    d: &hir::diagnostics::NoSuchField,
+) -> Option<Fix> {
+    let record_expr = sema.ast(d);
+
+    let record_lit = ast::RecordLit::cast(record_expr.syntax().parent()?.parent()?)?;
+    let def_id = sema.resolve_variant(record_lit)?;
+    let module;
+    let def_file_id;
+    let record_fields = match VariantDef::from(def_id) {
+        VariantDef::Struct(s) => {
+            module = s.module(sema.db);
+            let source = s.source(sema.db);
+            def_file_id = source.file_id;
+            let fields = source.value.field_def_list()?;
+            record_field_def_list(fields)?
+        }
+        VariantDef::Union(u) => {
+            module = u.module(sema.db);
+            let source = u.source(sema.db);
+            def_file_id = source.file_id;
+            source.value.record_field_def_list()?
+        }
+        VariantDef::EnumVariant(e) => {
+            module = e.module(sema.db);
+            let source = e.source(sema.db);
+            def_file_id = source.file_id;
+            let fields = source.value.field_def_list()?;
+            record_field_def_list(fields)?
+        }
+    };
+    let def_file_id = def_file_id.original_file(sema.db);
+
+    let new_field_type = sema.type_of_expr(&record_expr.expr()?)?;
+    if new_field_type.is_unknown() {
+        return None;
+    }
+    let new_field = make::record_field_def(
+        record_expr.field_name()?,
+        make::type_ref(&new_field_type.display_source_code(sema.db, module.into()).ok()?),
+    );
+
+    let last_field = record_fields.fields().last()?;
+    let last_field_syntax = last_field.syntax();
+    let indent = IndentLevel::from_node(last_field_syntax);
+
+    let mut new_field = new_field.to_string();
+    if usage_file_id != def_file_id {
+        new_field = format!("pub(crate) {}", new_field);
+    }
+    new_field = format!("\n{}{}", indent, new_field);
+
+    let needs_comma = !last_field_syntax.to_string().ends_with(',');
+    if needs_comma {
+        new_field = format!(",{}", new_field);
+    }
+
+    let source_change = SourceFileEdit {
+        file_id: def_file_id,
+        edit: TextEdit::insert(last_field_syntax.text_range().end(), new_field),
+    };
+    let fix = Fix::new("Create field", source_change.into());
+    return Some(fix);
+
+    fn record_field_def_list(field_def_list: ast::FieldDefList) -> Option<ast::RecordFieldDefList> {
+        match field_def_list {
+            ast::FieldDefList::RecordFieldDefList(it) => Some(it),
+            ast::FieldDefList::TupleFieldDefList(_) => None,
+        }
+    }
 }
 
 fn check_unnecessary_braces_in_use_statement(
@@ -187,7 +259,8 @@ fn check_struct_shorthand_initialization(
         if let (Some(name_ref), Some(expr)) = (record_field.name_ref(), record_field.expr()) {
             let field_name = name_ref.syntax().text().to_string();
             let field_expr = expr.syntax().text().to_string();
-            if field_name == field_expr {
+            let field_name_is_tup_index = name_ref.as_tuple_field().is_some();
+            if field_name == field_expr && !field_name_is_tup_index {
                 let mut edit_builder = TextEditBuilder::default();
                 edit_builder.delete(record_field.syntax().text_range());
                 edit_builder.insert(record_field.syntax().text_range().start(), field_name);
@@ -210,51 +283,21 @@ fn check_struct_shorthand_initialization(
 
 #[cfg(test)]
 mod tests {
-    use insta::assert_debug_snapshot;
-    use ra_syntax::SourceFile;
-    use stdx::SepBy;
+    use stdx::trim_indent;
     use test_utils::assert_eq_text;
 
-    use crate::mock_analysis::{analysis_and_position, single_file};
-
-    use super::*;
-
-    type DiagnosticChecker = fn(&mut Vec<Diagnostic>, FileId, &SyntaxNode) -> Option<()>;
-
-    fn check_not_applicable(code: &str, func: DiagnosticChecker) {
-        let parse = SourceFile::parse(code);
-        let mut diagnostics = Vec::new();
-        for node in parse.tree().syntax().descendants() {
-            func(&mut diagnostics, FileId(0), &node);
-        }
-        assert!(diagnostics.is_empty());
-    }
-
-    fn check_apply(before: &str, after: &str, func: DiagnosticChecker) {
-        let parse = SourceFile::parse(before);
-        let mut diagnostics = Vec::new();
-        for node in parse.tree().syntax().descendants() {
-            func(&mut diagnostics, FileId(0), &node);
-        }
-        let diagnostic =
-            diagnostics.pop().unwrap_or_else(|| panic!("no diagnostics for:\n{}\n", before));
-        let mut fix = diagnostic.fix.unwrap();
-        let edit = fix.source_change.source_file_edits.pop().unwrap().edit;
-        let actual = {
-            let mut actual = before.to_string();
-            edit.apply(&mut actual);
-            actual
-        };
-        assert_eq_text!(after, &actual);
-    }
+    use crate::mock_analysis::{analysis_and_position, single_file, MockAnalysis};
+    use expect::{expect, Expect};
 
     /// Takes a multi-file input fixture with annotated cursor positions,
     /// and checks that:
     ///  * a diagnostic is produced
     ///  * this diagnostic touches the input cursor position
     ///  * that the contents of the file containing the cursor match `after` after the diagnostic fix is applied
-    fn check_apply_diagnostic_fix_from_position(fixture: &str, after: &str) {
-        let (analysis, file_position) = analysis_and_position(fixture);
+    fn check_fix(ra_fixture_before: &str, ra_fixture_after: &str) {
+        let after = trim_indent(ra_fixture_after);
+
+        let (analysis, file_position) = analysis_and_position(ra_fixture_before);
         let diagnostic = analysis.diagnostics(file_position.file_id).unwrap().pop().unwrap();
         let mut fix = diagnostic.fix.unwrap();
         let edit = fix.source_change.source_file_edits.pop().unwrap().edit;
@@ -264,21 +307,6 @@ mod tests {
             edit.apply(&mut actual);
             actual
         };
-
-        // Strip indent and empty lines from `after`, to match the behaviour of
-        // `parse_fixture` called from `analysis_and_position`.
-        let margin = fixture
-            .lines()
-            .filter(|it| it.trim_start().starts_with("//-"))
-            .map(|it| it.len() - it.trim_start().len())
-            .next()
-            .expect("empty fixture");
-        let after = after
-            .lines()
-            .filter_map(|line| if line.len() > margin { Some(&line[margin..]) } else { None })
-            .sep_by("\n")
-            .suffix("\n")
-            .to_string();
 
         assert_eq_text!(&after, &actual);
         assert!(
@@ -290,508 +318,470 @@ mod tests {
         );
     }
 
-    fn check_apply_diagnostic_fix(before: &str, after: &str) {
-        let (analysis, file_id) = single_file(before);
-        let diagnostic = analysis.diagnostics(file_id).unwrap().pop().unwrap();
+    /// Checks that a diagnostic applies to the file containing the `<|>` cursor marker
+    /// which has a fix that can apply to other files.
+    fn check_apply_diagnostic_fix_in_other_file(ra_fixture_before: &str, ra_fixture_after: &str) {
+        let ra_fixture_after = &trim_indent(ra_fixture_after);
+        let (analysis, file_pos) = analysis_and_position(ra_fixture_before);
+        let current_file_id = file_pos.file_id;
+        let diagnostic = analysis.diagnostics(current_file_id).unwrap().pop().unwrap();
         let mut fix = diagnostic.fix.unwrap();
-        let edit = fix.source_change.source_file_edits.pop().unwrap().edit;
+        let edit = fix.source_change.source_file_edits.pop().unwrap();
+        let changed_file_id = edit.file_id;
+        let before = analysis.file_text(changed_file_id).unwrap();
         let actual = {
             let mut actual = before.to_string();
-            edit.apply(&mut actual);
+            edit.edit.apply(&mut actual);
             actual
         };
-        assert_eq_text!(after, &actual);
+        assert_eq_text!(ra_fixture_after, &actual);
     }
 
     /// Takes a multi-file input fixture with annotated cursor position and checks that no diagnostics
     /// apply to the file containing the cursor.
-    fn check_no_diagnostic_for_target_file(fixture: &str) {
-        let (analysis, file_position) = analysis_and_position(fixture);
-        let diagnostics = analysis.diagnostics(file_position.file_id).unwrap();
-        assert_eq!(diagnostics.len(), 0);
+    fn check_no_diagnostics(ra_fixture: &str) {
+        let mock = MockAnalysis::with_files(ra_fixture);
+        let files = mock.files().map(|(it, _)| it).collect::<Vec<_>>();
+        let analysis = mock.analysis();
+        let diagnostics = files
+            .into_iter()
+            .flat_map(|file_id| analysis.diagnostics(file_id).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(diagnostics.len(), 0, "unexpected diagnostics:\n{:#?}", diagnostics);
     }
 
-    fn check_no_diagnostic(content: &str) {
-        let (analysis, file_id) = single_file(content);
+    fn check_expect(ra_fixture: &str, expect: Expect) {
+        let (analysis, file_id) = single_file(ra_fixture);
         let diagnostics = analysis.diagnostics(file_id).unwrap();
-        assert_eq!(diagnostics.len(), 0, "expected no diagnostic, found one");
+        expect.assert_debug_eq(&diagnostics)
     }
 
     #[test]
     fn test_wrap_return_type() {
-        let before = r#"
-            //- /main.rs
-            use std::{string::String, result::Result::{self, Ok, Err}};
+        check_fix(
+            r#"
+//- /main.rs
+use core::result::Result::{self, Ok, Err};
 
-            fn div(x: i32, y: i32) -> Result<i32, String> {
-                if y == 0 {
-                    return Err("div by zero".into());
-                }
-                x / y<|>
-            }
+fn div(x: i32, y: i32) -> Result<i32, ()> {
+    if y == 0 {
+        return Err(());
+    }
+    x / y<|>
+}
+//- /core/lib.rs
+pub mod result {
+    pub enum Result<T, E> { Ok(T), Err(E) }
+}
+"#,
+            r#"
+use core::result::Result::{self, Ok, Err};
 
-            //- /std/lib.rs
-            pub mod string {
-                pub struct String { }
-            }
-            pub mod result {
-                pub enum Result<T, E> { Ok(T), Err(E) }
-            }
-        "#;
-        let after = r#"
-            use std::{string::String, result::Result::{self, Ok, Err}};
-
-            fn div(x: i32, y: i32) -> Result<i32, String> {
-                if y == 0 {
-                    return Err("div by zero".into());
-                }
-                Ok(x / y)
-            }
-        "#;
-        check_apply_diagnostic_fix_from_position(before, after);
+fn div(x: i32, y: i32) -> Result<i32, ()> {
+    if y == 0 {
+        return Err(());
+    }
+    Ok(x / y)
+}
+"#,
+        );
     }
 
     #[test]
     fn test_wrap_return_type_handles_generic_functions() {
-        let before = r#"
-            //- /main.rs
-            use std::result::Result::{self, Ok, Err};
+        check_fix(
+            r#"
+//- /main.rs
+use core::result::Result::{self, Ok, Err};
 
-            fn div<T>(x: T) -> Result<T, i32> {
-                if x == 0 {
-                    return Err(7);
-                }
-                <|>x
-            }
+fn div<T>(x: T) -> Result<T, i32> {
+    if x == 0 {
+        return Err(7);
+    }
+    <|>x
+}
+//- /core/lib.rs
+pub mod result {
+    pub enum Result<T, E> { Ok(T), Err(E) }
+}
+"#,
+            r#"
+use core::result::Result::{self, Ok, Err};
 
-            //- /std/lib.rs
-            pub mod result {
-                pub enum Result<T, E> { Ok(T), Err(E) }
-            }
-        "#;
-        let after = r#"
-            use std::result::Result::{self, Ok, Err};
-
-            fn div<T>(x: T) -> Result<T, i32> {
-                if x == 0 {
-                    return Err(7);
-                }
-                Ok(x)
-            }
-        "#;
-        check_apply_diagnostic_fix_from_position(before, after);
+fn div<T>(x: T) -> Result<T, i32> {
+    if x == 0 {
+        return Err(7);
+    }
+    Ok(x)
+}
+"#,
+        );
     }
 
     #[test]
     fn test_wrap_return_type_handles_type_aliases() {
-        let before = r#"
-            //- /main.rs
-            use std::{string::String, result::Result::{self, Ok, Err}};
+        check_fix(
+            r#"
+//- /main.rs
+use core::result::Result::{self, Ok, Err};
 
-            type MyResult<T> = Result<T, String>;
+type MyResult<T> = Result<T, ()>;
 
-            fn div(x: i32, y: i32) -> MyResult<i32> {
-                if y == 0 {
-                    return Err("div by zero".into());
-                }
-                x <|>/ y
-            }
+fn div(x: i32, y: i32) -> MyResult<i32> {
+    if y == 0 {
+        return Err(());
+    }
+    x <|>/ y
+}
+//- /core/lib.rs
+pub mod result {
+    pub enum Result<T, E> { Ok(T), Err(E) }
+}
+"#,
+            r#"
+use core::result::Result::{self, Ok, Err};
 
-            //- /std/lib.rs
-            pub mod string {
-                pub struct String { }
-            }
-            pub mod result {
-                pub enum Result<T, E> { Ok(T), Err(E) }
-            }
-        "#;
-        let after = r#"
-            use std::{string::String, result::Result::{self, Ok, Err}};
+type MyResult<T> = Result<T, ()>;
 
-            type MyResult<T> = Result<T, String>;
-            fn div(x: i32, y: i32) -> MyResult<i32> {
-                if y == 0 {
-                    return Err("div by zero".into());
-                }
-                Ok(x / y)
-            }
-        "#;
-        check_apply_diagnostic_fix_from_position(before, after);
+fn div(x: i32, y: i32) -> MyResult<i32> {
+    if y == 0 {
+        return Err(());
+    }
+    Ok(x / y)
+}
+"#,
+        );
     }
 
     #[test]
     fn test_wrap_return_type_not_applicable_when_expr_type_does_not_match_ok_type() {
-        let content = r#"
-            //- /main.rs
-            use std::{string::String, result::Result::{self, Ok, Err}};
+        check_no_diagnostics(
+            r#"
+//- /main.rs
+use core::result::Result::{self, Ok, Err};
 
-            fn foo() -> Result<String, i32> {
-                0<|>
-            }
+fn foo() -> Result<(), i32> { 0 }
 
-            //- /std/lib.rs
-            pub mod string {
-                pub struct String { }
-            }
-            pub mod result {
-                pub enum Result<T, E> { Ok(T), Err(E) }
-            }
-        "#;
-        check_no_diagnostic_for_target_file(content);
+//- /core/lib.rs
+pub mod result {
+    pub enum Result<T, E> { Ok(T), Err(E) }
+}
+"#,
+        );
     }
 
     #[test]
     fn test_wrap_return_type_not_applicable_when_return_type_is_not_result() {
-        let content = r#"
-            //- /main.rs
-            use std::{string::String, result::Result::{self, Ok, Err}};
+        check_no_diagnostics(
+            r#"
+//- /main.rs
+use core::result::Result::{self, Ok, Err};
 
-            enum SomeOtherEnum {
-                Ok(i32),
-                Err(String),
-            }
+enum SomeOtherEnum { Ok(i32), Err(String) }
 
-            fn foo() -> SomeOtherEnum {
-                0<|>
-            }
+fn foo() -> SomeOtherEnum { 0 }
 
-            //- /std/lib.rs
-            pub mod string {
-                pub struct String { }
-            }
-            pub mod result {
-                pub enum Result<T, E> { Ok(T), Err(E) }
-            }
-        "#;
-        check_no_diagnostic_for_target_file(content);
+//- /core/lib.rs
+pub mod result {
+    pub enum Result<T, E> { Ok(T), Err(E) }
+}
+"#,
+        );
     }
 
     #[test]
     fn test_fill_struct_fields_empty() {
-        let before = r"
-            struct TestStruct {
-                one: i32,
-                two: i64,
-            }
+        check_fix(
+            r#"
+struct TestStruct { one: i32, two: i64 }
 
-            fn test_fn() {
-                let s = TestStruct{};
-            }
-        ";
-        let after = r"
-            struct TestStruct {
-                one: i32,
-                two: i64,
-            }
+fn test_fn() {
+    let s = TestStruct {<|>};
+}
+"#,
+            r#"
+struct TestStruct { one: i32, two: i64 }
 
-            fn test_fn() {
-                let s = TestStruct{ one: (), two: ()};
-            }
-        ";
-        check_apply_diagnostic_fix(before, after);
+fn test_fn() {
+    let s = TestStruct { one: (), two: ()};
+}
+"#,
+        );
     }
 
     #[test]
     fn test_fill_struct_fields_self() {
-        let before = r"
-            struct TestStruct {
-                one: i32,
-            }
+        check_fix(
+            r#"
+struct TestStruct { one: i32 }
 
-            impl TestStruct {
-                fn test_fn() {
-                    let s = Self {};
-                }
-            }
-        ";
-        let after = r"
-            struct TestStruct {
-                one: i32,
-            }
+impl TestStruct {
+    fn test_fn() { let s = Self {<|>}; }
+}
+"#,
+            r#"
+struct TestStruct { one: i32 }
 
-            impl TestStruct {
-                fn test_fn() {
-                    let s = Self { one: ()};
-                }
-            }
-        ";
-        check_apply_diagnostic_fix(before, after);
+impl TestStruct {
+    fn test_fn() { let s = Self { one: ()}; }
+}
+"#,
+        );
     }
 
     #[test]
     fn test_fill_struct_fields_enum() {
-        let before = r"
-            enum Expr {
-                Bin { lhs: Box<Expr>, rhs: Box<Expr> }
-            }
+        check_fix(
+            r#"
+enum Expr {
+    Bin { lhs: Box<Expr>, rhs: Box<Expr> }
+}
 
-            impl Expr {
-                fn new_bin(lhs: Box<Expr>, rhs: Box<Expr>) -> Expr {
-                    Expr::Bin { <|> }
-                }
-            }
+impl Expr {
+    fn new_bin(lhs: Box<Expr>, rhs: Box<Expr>) -> Expr {
+        Expr::Bin {<|> }
+    }
+}
+"#,
+            r#"
+enum Expr {
+    Bin { lhs: Box<Expr>, rhs: Box<Expr> }
+}
 
-        ";
-        let after = r"
-            enum Expr {
-                Bin { lhs: Box<Expr>, rhs: Box<Expr> }
-            }
-
-            impl Expr {
-                fn new_bin(lhs: Box<Expr>, rhs: Box<Expr>) -> Expr {
-                    Expr::Bin { lhs: (), rhs: () <|> }
-                }
-            }
-
-        ";
-        check_apply_diagnostic_fix(before, after);
+impl Expr {
+    fn new_bin(lhs: Box<Expr>, rhs: Box<Expr>) -> Expr {
+        Expr::Bin { lhs: (), rhs: () }
+    }
+}
+"#,
+        );
     }
 
     #[test]
     fn test_fill_struct_fields_partial() {
-        let before = r"
-            struct TestStruct {
-                one: i32,
-                two: i64,
-            }
+        check_fix(
+            r#"
+struct TestStruct { one: i32, two: i64 }
 
-            fn test_fn() {
-                let s = TestStruct{ two: 2 };
-            }
-        ";
-        let after = r"
-            struct TestStruct {
-                one: i32,
-                two: i64,
-            }
+fn test_fn() {
+    let s = TestStruct{ two: 2<|> };
+}
+"#,
+            r"
+struct TestStruct { one: i32, two: i64 }
 
-            fn test_fn() {
-                let s = TestStruct{ two: 2, one: () };
-            }
-        ";
-        check_apply_diagnostic_fix(before, after);
+fn test_fn() {
+    let s = TestStruct{ two: 2, one: () };
+}
+",
+        );
     }
 
     #[test]
     fn test_fill_struct_fields_no_diagnostic() {
-        let content = r"
-            struct TestStruct {
-                one: i32,
-                two: i64,
-            }
+        check_no_diagnostics(
+            r"
+            struct TestStruct { one: i32, two: i64 }
 
             fn test_fn() {
                 let one = 1;
                 let s = TestStruct{ one, two: 2 };
             }
-        ";
-
-        check_no_diagnostic(content);
+        ",
+        );
     }
 
     #[test]
     fn test_fill_struct_fields_no_diagnostic_on_spread() {
-        let content = r"
-            struct TestStruct {
-                one: i32,
-                two: i64,
-            }
+        check_no_diagnostics(
+            r"
+            struct TestStruct { one: i32, two: i64 }
 
             fn test_fn() {
                 let one = 1;
                 let s = TestStruct{ ..a };
             }
-        ";
-
-        check_no_diagnostic(content);
+        ",
+        );
     }
 
     #[test]
     fn test_unresolved_module_diagnostic() {
-        let (analysis, file_id) = single_file("mod foo;");
-        let diagnostics = analysis.diagnostics(file_id).unwrap();
-        assert_debug_snapshot!(diagnostics, @r###"
-        [
-            Diagnostic {
-                message: "unresolved module",
-                range: 0..8,
-                severity: Error,
-                fix: Some(
-                    Fix {
-                        label: "Create module",
-                        source_change: SourceChange {
-                            source_file_edits: [],
-                            file_system_edits: [
-                                CreateFile {
-                                    source_root: SourceRootId(
-                                        0,
-                                    ),
-                                    path: "foo.rs",
+        check_expect(
+            r#"mod foo;"#,
+            expect![[r#"
+                [
+                    Diagnostic {
+                        message: "unresolved module",
+                        range: 0..8,
+                        severity: Error,
+                        fix: Some(
+                            Fix {
+                                label: "Create module",
+                                source_change: SourceChange {
+                                    source_file_edits: [],
+                                    file_system_edits: [
+                                        CreateFile {
+                                            anchor: FileId(
+                                                1,
+                                            ),
+                                            dst: "foo.rs",
+                                        },
+                                    ],
+                                    is_snippet: false,
                                 },
-                            ],
-                            is_snippet: false,
-                        },
+                            },
+                        ),
                     },
-                ),
-            },
-        ]
-        "###);
+                ]
+            "#]],
+        );
     }
 
     #[test]
     fn range_mapping_out_of_macros() {
-        let (analysis, file_id) = single_file(
-            r"
-            fn some() {}
-            fn items() {}
-            fn here() {}
+        // FIXME: this is very wrong, but somewhat tricky to fix.
+        check_fix(
+            r#"
+fn some() {}
+fn items() {}
+fn here() {}
 
-            macro_rules! id {
-                ($($tt:tt)*) => { $($tt)*};
-            }
+macro_rules! id { ($($tt:tt)*) => { $($tt)*}; }
 
-            fn main() {
-                let _x = id![Foo { a: 42 }];
-            }
+fn main() {
+    let _x = id![Foo { a: <|>42 }];
+}
 
-            pub struct Foo {
-                pub a: i32,
-                pub b: i32,
-            }
-        ",
+pub struct Foo { pub a: i32, pub b: i32 }
+"#,
+            r#"
+fn {a:42, b: ()} {}
+fn items() {}
+fn here() {}
+
+macro_rules! id { ($($tt:tt)*) => { $($tt)*}; }
+
+fn main() {
+    let _x = id![Foo { a: 42 }];
+}
+
+pub struct Foo { pub a: i32, pub b: i32 }
+"#,
         );
-        let diagnostics = analysis.diagnostics(file_id).unwrap();
-        assert_debug_snapshot!(diagnostics, @r###"
-        [
-            Diagnostic {
-                message: "Missing structure fields:\n- b\n",
-                range: 224..233,
-                severity: Error,
-                fix: Some(
-                    Fix {
-                        label: "Fill struct fields",
-                        source_change: SourceChange {
-                            source_file_edits: [
-                                SourceFileEdit {
-                                    file_id: FileId(
-                                        1,
-                                    ),
-                                    edit: TextEdit {
-                                        indels: [
-                                            Indel {
-                                                insert: "{a:42, b: ()}",
-                                                delete: 3..9,
-                                            },
-                                        ],
-                                    },
-                                },
-                            ],
-                            file_system_edits: [],
-                            is_snippet: false,
-                        },
-                    },
-                ),
-            },
-        ]
-        "###);
     }
 
     #[test]
     fn test_check_unnecessary_braces_in_use_statement() {
-        check_not_applicable(
-            "
-            use a;
-            use a::{c, d::e};
-        ",
-            check_unnecessary_braces_in_use_statement,
+        check_no_diagnostics(
+            r#"
+use a;
+use a::{c, d::e};
+"#,
         );
-        check_apply("use {b};", "use b;", check_unnecessary_braces_in_use_statement);
-        check_apply("use a::{c};", "use a::c;", check_unnecessary_braces_in_use_statement);
-        check_apply("use a::{self};", "use a;", check_unnecessary_braces_in_use_statement);
-        check_apply(
-            "use a::{c, d::{e}};",
-            "use a::{c, d::e};",
-            check_unnecessary_braces_in_use_statement,
-        );
+        check_fix(r#"use {<|>b};"#, r#"use b;"#);
+        check_fix(r#"use {b<|>};"#, r#"use b;"#);
+        check_fix(r#"use a::{c<|>};"#, r#"use a::c;"#);
+        check_fix(r#"use a::{self<|>};"#, r#"use a;"#);
+        check_fix(r#"use a::{c, d::{e<|>}};"#, r#"use a::{c, d::e};"#);
     }
 
     #[test]
     fn test_check_struct_shorthand_initialization() {
-        check_not_applicable(
+        check_no_diagnostics(
             r#"
-            struct A {
-                a: &'static str
-            }
+struct A { a: &'static str }
+fn main() { A { a: "hello" } }
+"#,
+        );
+        check_no_diagnostics(
+            r#"
+struct A(usize);
+fn main() { A { 0: 0 } }
+"#,
+        );
+
+        check_fix(
+            r#"
+struct A { a: &'static str }
+fn main() {
+    let a = "haha";
+    A { a<|>: a }
+}
+"#,
+            r#"
+struct A { a: &'static str }
+fn main() {
+    let a = "haha";
+    A { a }
+}
+"#,
+        );
+
+        check_fix(
+            r#"
+struct A { a: &'static str, b: &'static str }
+fn main() {
+    let a = "haha";
+    let b = "bb";
+    A { a<|>: a, b }
+}
+"#,
+            r#"
+struct A { a: &'static str, b: &'static str }
+fn main() {
+    let a = "haha";
+    let b = "bb";
+    A { a, b }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_add_field_from_usage() {
+        check_fix(
+            r"
+fn main() {
+    Foo { bar: 3, baz<|>: false};
+}
+struct Foo {
+    bar: i32
+}
+",
+            r"
+fn main() {
+    Foo { bar: 3, baz: false};
+}
+struct Foo {
+    bar: i32,
+    baz: bool
+}
+",
+        )
+    }
+
+    #[test]
+    fn test_add_field_in_other_file_from_usage() {
+        check_apply_diagnostic_fix_in_other_file(
+            r"
+            //- /main.rs
+            mod foo;
 
             fn main() {
-                A {
-                    a: "hello"
-                }
+                <|>foo::Foo { bar: 3, baz: false};
             }
-        "#,
-            check_struct_shorthand_initialization,
-        );
-
-        check_apply(
-            r#"
-struct A {
-    a: &'static str
-}
-
-fn main() {
-    let a = "haha";
-    A {
-        a: a
-    }
-}
-        "#,
-            r#"
-struct A {
-    a: &'static str
-}
-
-fn main() {
-    let a = "haha";
-    A {
-        a
-    }
-}
-        "#,
-            check_struct_shorthand_initialization,
-        );
-
-        check_apply(
-            r#"
-struct A {
-    a: &'static str,
-    b: &'static str
-}
-
-fn main() {
-    let a = "haha";
-    let b = "bb";
-    A {
-        a: a,
-        b
-    }
-}
-        "#,
-            r#"
-struct A {
-    a: &'static str,
-    b: &'static str
-}
-
-fn main() {
-    let a = "haha";
-    let b = "bb";
-    A {
-        a,
-        b
-    }
-}
-        "#,
-            check_struct_shorthand_initialization,
-        );
+            //- /foo.rs
+            struct Foo {
+                bar: i32
+            }
+            ",
+            r"
+            struct Foo {
+                bar: i32,
+                pub(crate) baz: bool
+            }
+            ",
+        )
     }
 }

@@ -1,10 +1,11 @@
 import * as vscode from 'vscode';
 import * as lc from 'vscode-languageclient';
 import * as ra from './lsp_ext';
-import * as toolchain from "./toolchain";
+import * as tasks from './tasks';
 
 import { Ctx } from './ctx';
 import { makeDebugConfig } from './debug';
+import { Config, RunnableEnvCfg } from './config';
 
 const quickPickButtons = [{ iconPath: new vscode.ThemeIcon("save"), tooltip: "Save as a launch.json configurtation." }];
 
@@ -95,52 +96,54 @@ export class RunnableQuickPick implements vscode.QuickPickItem {
     }
 }
 
-interface CargoTaskDefinition extends vscode.TaskDefinition {
-    type: 'cargo';
-    label: string;
-    command: string;
-    args: string[];
-    env?: { [key: string]: string };
+export function prepareEnv(runnable: ra.Runnable, runnableEnvCfg: RunnableEnvCfg): Record<string, string> {
+    const env: Record<string, string> = { "RUST_BACKTRACE": "short" };
+
+    if (runnable.args.expectTest) {
+        env["UPDATE_EXPECT"] = "1";
+    }
+
+    Object.assign(env, process.env as { [key: string]: string });
+
+    if (runnableEnvCfg) {
+        if (Array.isArray(runnableEnvCfg)) {
+            for (const it of runnableEnvCfg) {
+                if (!it.mask || new RegExp(it.mask).test(runnable.label)) {
+                    Object.assign(env, it.env);
+                }
+            }
+        } else {
+            Object.assign(env, runnableEnvCfg);
+        }
+    }
+
+    return env;
 }
 
-export function createTask(runnable: ra.Runnable): vscode.Task {
-    const TASK_SOURCE = 'Rust';
+export async function createTask(runnable: ra.Runnable, config: Config): Promise<vscode.Task> {
+    if (runnable.kind !== "cargo") {
+        // rust-analyzer supports only one kind, "cargo"
+        // do not use tasks.TASK_TYPE here, these are completely different meanings.
 
-    let command;
-    switch (runnable.kind) {
-        case "cargo": command = toolchain.getPathForExecutable("cargo");
+        throw `Unexpected runnable kind: ${runnable.kind}`;
     }
-    const args = runnable.args.cargoArgs;
+
+    const args = [...runnable.args.cargoArgs]; // should be a copy!
     if (runnable.args.executableArgs.length > 0) {
         args.push('--', ...runnable.args.executableArgs);
     }
-    const definition: CargoTaskDefinition = {
-        type: 'cargo',
-        label: runnable.label,
-        command,
-        args,
-        env: Object.assign({}, process.env as { [key: string]: string }, { "RUST_BACKTRACE": "short" }),
+
+    const definition: tasks.CargoTaskDefinition = {
+        type: tasks.TASK_TYPE,
+        command: args[0], // run, test, etc...
+        args: args.slice(1),
+        cwd: runnable.args.workspaceRoot || ".",
+        env: prepareEnv(runnable, config.runnableEnv),
     };
 
-    const execOption: vscode.ShellExecutionOptions = {
-        cwd: runnable.args.workspaceRoot || '.',
-        env: definition.env,
-    };
-    const exec = new vscode.ShellExecution(
-        definition.command,
-        definition.args,
-        execOption,
-    );
+    const target = vscode.workspace.workspaceFolders![0]; // safe, see main activate()
+    const cargoTask = await tasks.buildCargoTask(target, definition, runnable.label, args, config.cargoRunner, true);
+    cargoTask.presentationOptions.clear = true;
 
-    const f = vscode.workspace.workspaceFolders![0];
-    const t = new vscode.Task(
-        definition,
-        f,
-        definition.label,
-        TASK_SOURCE,
-        exec,
-        ['$rustc'],
-    );
-    t.presentationOptions.clear = true;
-    return t;
+    return cargoTask;
 }
